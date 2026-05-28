@@ -1,0 +1,8 @@
+
+*** Stock Analyzer running at http://localhost:5000 ***
+
+ * Serving Flask app 'app'
+ * Debug mode: on
+
+*** Stock Analyzer running at http://localhost:5000 ***
+

@@ -1,0 +1,17 @@
+WARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.
+ * Running on http://127.0.0.1:5000
+Press CTRL+C to quit
+ * Restarting with watchdog (windowsapi)
+ * Debugger is active!
+ * Debugger PIN: 107-632-653
+127.0.0.1 - - [28/May/2026 10:30:23] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [28/May/2026 10:38:53] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [28/May/2026 10:39:05] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [28/May/2026 10:39:28] "GET /api/search?q=CANBK&_=1779944966776 HTTP/1.1" 200 -
+127.0.0.1 - - [28/May/2026 10:39:29] "GET /api/search?q=CANBK&_=1779944967733 HTTP/1.1" 200 -
+127.0.0.1 - - [28/May/2026 10:39:37] "GET /api/analyze?slug=CANBK&name=Canara%20Bank&_=1779944969361 HTTP/1.1" 500 -
+127.0.0.1 - - [28/May/2026 10:39:51] "GET /api/analyze?slug=CANBK&name=Canara%20Bank&_=1779944985051 HTTP/1.1" 500 -
+ * Detected change in 'E:\\Deepak\\Stock_selection\\app.py', reloading
+Exception in thread Thread-2 (serve_forever):
+Traceback (most recent call last):
+  File "C:\Python312\Lib\threading.py", line 1052, in _bootstrap_inner
