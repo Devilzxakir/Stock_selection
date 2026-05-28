@@ -328,6 +328,8 @@
     display: flex; align-items: center; gap: 8px;
   }
 
+  .upload-btn:hover { border-color: var(--acc); background: rgba(79,142,247,0.05); }
+
   /* ── METRIC GRID ── */
   .metric-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 
@@ -546,6 +548,32 @@
   <div id="dropdown"></div>
 </div>
 
+<!-- EXCEL UPLOAD OPTION -->
+<div class="upload-wrap" style="text-align:center;padding:16px 24px 32px;position:relative;z-index:1">
+  <div style="color:var(--muted);font-size:13px;margin-bottom:12px">— OR —</div>
+  <label class="upload-btn" style="display:inline-flex;align-items:center;gap:8px;background:var(--bg3);border:1px dashed var(--border);border-radius:12px;padding:14px 24px;cursor:pointer;transition:all .2s">
+    <span style="font-size:20px">📊</span>
+    <span style="font-size:14px;color:var(--text)">Upload Screener.in Excel Sheet</span>
+    <input type="file" id="excelUpload" accept=".xlsx,.xls" style="display:none">
+  </label>
+  <div id="uploadStatus" style="font-size:12px;color:var(--muted);margin-top:8px"></div>
+
+  <!-- GUIDE -->
+  <div style="max-width:500px;margin:20px auto 0;background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:16px;text-align:left">
+    <div style="font-size:12px;color:var(--acc);font-weight:600;margin-bottom:10px">How to download Excel from Screener.in:</div>
+    <ol style="font-size:11px;color:var(--muted);line-height:1.7;padding-left:18px">
+      <li>Go to <a href="https://www.screener.in" target="_blank" style="color:var(--acc)">screener.in</a> and search your company</li>
+      <li>Click on the company name to open its page</li>
+      <li>Click <strong>"Export"</strong> button (or look for download option)</li>
+      <li>Select <strong>"Download Excel"</strong> or <strong>"Data Sheet"</strong></li>
+      <li>Upload that <code>.xlsx</code> file here</li>
+    </ol>
+    <div style="font-size:10px;color:var(--muted);margin-top:10px;padding-top:8px;border-top:1px solid var(--border)">
+      💡 <strong>Tip:</strong> Use this if live data is slow or session expired. Your uploaded data is processed locally and never stored.
+    </div>
+  </div>
+</div>
+
 <!-- LOADER -->
 <div id="loader">
   <div class="spin-ring"></div>
@@ -569,6 +597,68 @@ const loader   = document.getElementById('loader');
 const results  = document.getElementById('results');
 const errorBox = document.getElementById('errorBox');
 const searchBtn= document.getElementById('searchBtn');
+const excelUpload = document.getElementById('excelUpload');
+const uploadStatus = document.getElementById('uploadStatus');
+
+// ── EXCEL UPLOAD HANDLER ──
+excelUpload.addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  uploadStatus.textContent = 'Processing Excel file...';
+  uploadStatus.style.color = 'var(--acc)';
+
+  const formData = new FormData();
+  formData.append('file', file);
+
+  // Try to extract company name from filename
+  let companyName = file.name.replace(/\.(xlsx|xls)$/i, '').replace(/_/g, ' ').trim();
+  if (companyName.toLowerCase().includes('consolidated')) {
+    companyName = companyName.replace(/consolidated/i, '').trim();
+  }
+
+  try {
+    loader.style.display = 'block';
+    results.style.display = 'none';
+    errorBox.style.display = 'none';
+
+    const res = await fetch('/api/analyze/excel', {
+      method: 'POST',
+      body: formData
+    });
+
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+
+    loader.style.display = 'none';
+    results.style.display = 'block';
+
+    // Use filename as company name if not in data
+    if (data.company_name && data.company_name !== 'Unknown') {
+      selectedName = data.company_name;
+    } else {
+      selectedName = companyName;
+      data.company_name = companyName;
+    }
+    selectedSlug = data.slug || companyName.toLowerCase().replace(/\s+/g, '-');
+
+    renderResults(data);
+    fetchLivePrice();
+    liveTimer = setInterval(fetchLivePrice, 30000);
+
+    uploadStatus.textContent = '✓ Analysis complete!';
+    uploadStatus.style.color = 'var(--green)';
+  } catch(err) {
+    loader.style.display = 'none';
+    errorBox.style.display = 'block';
+    errorBox.textContent = '❌  ' + err.message;
+    uploadStatus.textContent = '✗ Upload failed';
+    uploadStatus.style.color = 'var(--red)';
+  }
+
+  // Reset file input
+  excelUpload.value = '';
+});
 
 // ── SEARCH DEBOUNCE ──
 input.addEventListener('input', () => {

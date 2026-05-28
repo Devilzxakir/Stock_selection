@@ -113,9 +113,9 @@ def parse_data_sheet(df):
             continue
 
         if years and col0 and col0 != "nan":
-            if i + 1 < len(df) and str(df.iloc[i+1, 0]).strip().upper() in SECTIONS:
-                cur_sec = None
-                continue
+            # Check if next row is a section header — but still process this row first
+            is_last_in_section = (i + 1 < len(df) and
+                                  str(df.iloc[i+1, 0]).strip().upper() in SECTIONS)
             has_val = any(str(df.iloc[i, c]).strip() not in ("nan", "") for c in range(1, len(df.columns)))
             if not has_val:
                 continue
@@ -124,6 +124,9 @@ def parse_data_sheet(df):
                 if j < len(years):
                     result[years[j]] = safe_float(df.iloc[i, c])
             sections[cur_sec]["data"][col0] = result
+            if is_last_in_section:
+                cur_sec = None
+                years = []
 
     # Parse PRICE row
     for i in range(len(df)):
@@ -158,6 +161,14 @@ def parse_data_sheet(df):
 
     return sections
 
+def metric_match(section_data, keywords):
+    """Find a metric in section data using substring matching (more robust than exact key lookup)."""
+    for name, data in section_data.items():
+        name_lower = name.lower()
+        if any(kw.lower() in name_lower for kw in keywords):
+            return data
+    return {}
+
 def compute_ratios(sections):
     """Compute derived ratios and inject them into existing sections."""
     pl = sections.get("Profit & Loss", {}).get("data", {})
@@ -168,26 +179,36 @@ def compute_ratios(sections):
 
     pl_years = sections.get("Profit & Loss", {}).get("years", [])
     bs_years = sections.get("Balance Sheet", {}).get("years", [])
-    cf_data = cf.get("Cash from Operating Activity", {})
-    all_years = sorted(set(pl_years) & set(bs_years))
-    if not all_years:
-        return
+    cf_data = metric_match(cf, ["cash from operating", "operating activity", "cfo"])
 
-    sales_d = pl.get("Sales", {})
-    np_d = pl.get("Net profit", {})
-    pbt_d = pl.get("Profit before tax", {})
-    dep_d = pl.get("Depreciation", {})
-    int_d = pl.get("Interest", {})
-    oi_d = pl.get("Other Income", {})
-    res_d = bs.get("Reserves", {})
-    eq_d = bs.get("Equity Share Capital", {})
-    debt_d = bs.get("Borrowings", {})
-    sh_d = bs.get("No. of Equity Shares", {})
-    tot_d = bs.get("Total", {})
-    ol_d = bs.get("Other Liabilities", {})
-    cash_d = bs.get("Cash & Bank", {})
-    inv_d = bs.get("Inventory", {})
-    recv_d = bs.get("Receivables", {})
+    def norm_year(y): return y.strip().replace(",", "").replace(" ", "").lower()
+    pl_years_norm = {norm_year(y): y for y in pl_years}
+    bs_years_norm = {norm_year(y): y for y in bs_years}
+    common_norm = sorted(set(pl_years_norm.keys()) & set(bs_years_norm.keys()))
+    if not common_norm:
+        # Fallback: just use P&L years if Balance Sheet years are unavailable
+        if pl_years:
+            common_norm = [norm_year(y) for y in pl_years]
+        else:
+            return
+    # Map back to original P&L year strings (canonical)
+    all_years = [pl_years_norm[y] for y in common_norm if y in pl_years_norm]
+
+    sales_d = metric_match(pl, ["sales", "revenue", "net sales"])
+    np_d = metric_match(pl, ["net profit", "profit after", "net income"])
+    pbt_d = metric_match(pl, ["profit before tax", "pbt", "profit before"])
+    dep_d = metric_match(pl, ["depreciation", "dep"])
+    int_d = metric_match(pl, ["interest"])
+    oi_d = metric_match(pl, ["other income"])
+    res_d = metric_match(bs, ["reserves"])
+    eq_d = metric_match(bs, ["equity share capital", "equity capital", "share capital"])
+    debt_d = metric_match(bs, ["borrowings", "debt", "total debt", "loans"])
+    sh_d = metric_match(bs, ["no. of equity shares", "number of equity shares", "equity shares", "no of shares"])
+    tot_d = metric_match(bs, ["total"])
+    ol_d = metric_match(bs, ["other liabilities", "other liability"])
+    cash_d = metric_match(bs, ["cash", "cash & bank", "cash and bank", "cash equivalent"])
+    inv_d = metric_match(bs, ["inventory", "inventories", "stock"])
+    recv_d = metric_match(bs, ["receivables", "debtors", "trade receivables", "account receivables"])
     meta_price = mt.get("Current Price", None)
 
     pl_data = sections.get("Profit & Loss", {}).get("data", {})
@@ -246,9 +267,18 @@ def compute_ratios(sections):
         if ebitda_ is not None and s and s > 0:
             key_data.setdefault("EBITDA Margin", {})[yr] = round((ebitda_ / s) * 100, 1)
 
+        # Normalize shares: Screener.in provides actual count (e.g., 100,000,000 for 10Cr shares)
+        # If value is small (< 1M), it might be in Crores already — multiply back
+        effective_shares = None
+        if shares is not None and shares > 0:
+            if shares < 1e6:
+                effective_shares = shares * 1e7
+            else:
+                effective_shares = shares
+
         # EPS
-        if np_ is not None and shares and shares > 0:
-            eps_val = round(np_ / (shares / 1e7), 2)
+        if np_ is not None and effective_shares and effective_shares > 0:
+            eps_val = round(np_ / (effective_shares / 1e7), 2)
             key_data.setdefault("EPS", {})[yr] = eps_val
 
         # P/E
@@ -260,9 +290,11 @@ def compute_ratios(sections):
         if np_ is not None and equity > 0:
             key_data.setdefault("ROE", {})[yr] = round((np_ / equity) * 100, 1)
 
-        # ROCE
-        if op is not None and tot is not None and ol is not None and (tot - ol) > 0:
-            key_data.setdefault("ROCE", {})[yr] = round((op / (tot - ol)) * 100, 1)
+        # ROCE = Operating Profit / Capital Employed (Equity + Total Borrowings)
+        if op is not None and (debt is not None or (equity) > 0):
+            capital_employed = (equity) + (debt or 0)
+            if capital_employed > 0:
+                key_data.setdefault("ROCE", {})[yr] = round((op / capital_employed) * 100, 1)
 
         # D/E
         if debt is not None and equity > 0:
@@ -273,8 +305,8 @@ def compute_ratios(sections):
             key_data.setdefault("Interest Coverage", {})[yr] = round(op / int_, 1)
 
         # BVPS
-        if shares and shares > 0:
-            key_data.setdefault("BVPS", {})[yr] = round(equity / (shares / 1e7), 2)
+        if effective_shares and effective_shares > 0:
+            key_data.setdefault("BVPS", {})[yr] = round(equity / (effective_shares / 1e7), 2)
 
         # Current Ratio (Current Assets / Current Liabilities — approximated as (Cash + Inventory + Receivables) / Borrowings)
         ca = (cash or 0) + (inv or 0) + (recv or 0)
@@ -322,6 +354,15 @@ def get_metric(sheets, sheet_kws, metric_kws):
 
 def fv(s): return list(s.values())[0]  if s else None
 def lv(s): return list(s.values())[-1] if s else None
+
+def normalize_shares(shares):
+    """Screener.in provides share count in actual number (e.g., 100M for 10Cr shares).
+    If value appears to be in Crores (< 1M), multiply back to actual count."""
+    if shares is None or shares <= 0:
+        return None
+    if shares < 1e6:
+        return shares * 1e7
+    return shares
 def yrs(s):
     k = list(s.keys())
     return len(k) - 1 if len(k) > 1 else 1
@@ -480,17 +521,19 @@ def altman_z_score(pl, bs, key, price, shares_outstanding):
     """Calculate Altman Z-Score for bankruptcy risk assessment."""
     try:
         # Get latest year available
-        sales = pl.get("Sales", {})
-        np_ = pl.get("Net profit", {})
-        op = pl.get("Operating Profit", {}) or key.get("EBITDA", {})
-        ta = bs.get("Total", {}) or bs.get("Total Assets", {})
-        cl = bs.get("Borrowings", {}) or bs.get("Total Liabilities", {})
-        ca = bs.get("Cash & Bank", {})
-        inv = bs.get("Inventory", {})
-        recv = bs.get("Receivables", {})
-        reserves = bs.get("Reserves", {})
+        sales = metric_match(pl, ["sales", "revenue", "net sales"])
+        np_ = metric_match(pl, ["net profit", "profit after", "net income"])
+        op = metric_match(pl, ["operating profit", "ebitda", "ebit"]) or metric_match(key, ["ebitda"])
+        ta = metric_match(bs, ["total", "total assets", "total liabilities"])
+        cl = metric_match(bs, ["borrowings", "debt", "total debt", "loans"])
+        ca = metric_match(bs, ["cash", "cash & bank", "cash and bank", "cash equivalent"])
+        inv = metric_match(bs, ["inventory", "inventories", "stock"])
+        recv = metric_match(bs, ["receivables", "debtors", "trade receivables"])
+        reserves = metric_match(bs, ["reserves"])
+        eq_sc = metric_match(bs, ["equity share capital", "equity capital", "share capital"])
+        borrowings = metric_match(bs, ["borrowings", "debt", "total debt"])
 
-        common = sorted(set(sales.keys()) & set(ta.keys()) & set(bs.get("Borrowings", {}).keys()))
+        common = sorted(set(sales.keys()) & set(ta.keys()) & set(borrowings.keys()))
         if not common:
             return {"z_score": None, "zone": "Insufficient data"}
 
@@ -503,8 +546,9 @@ def altman_z_score(pl, bs, key, price, shares_outstanding):
         cl_val = cl.get(yr, 1) or 1
         re_val = reserves.get(yr, 0) or 0
         de_val = cl.get(yr, 0) or 0
-        eq_val = (bs.get("Equity Share Capital", {}).get(yr, 0) or 0) + re_val
-        mv = (price or 0) * (shares_outstanding or 1) / 1e7  # Cr
+        eq_val = (eq_sc.get(yr, 0) or 0) + re_val
+        shares_norm = normalize_shares(shares_outstanding)
+        mv = (price or 0) * (shares_norm or 1) / 1e7  # Cr
 
         wc = ca_val - cl_val
         total_liab = t - eq_val
@@ -571,17 +615,18 @@ def magic_formula_rank(key, pl, bs, price, shares_outstanding):
         roce_vals = list(key.get("ROCE", {}).values())
         roce_latest = roce_vals[-1] if roce_vals else None
         # Earnings Yield = EBIT / Enterprise Value
-        ebit = key.get("EBITDA", {})
+        ebit = metric_match(key, ["ebitda"])
         ebit_vals = list(ebit.values())
         ebit_latest = ebit_vals[-1] if ebit_vals else None
-        debt = list(bs.get("Borrowings", {}).values())
+        debt = list(metric_match(bs, ["borrowings", "debt", "total debt"]).values())
         debt_latest = debt[-1] if debt else 0
-        cash = list(bs.get("Cash & Bank", {}).values())
+        cash = list(metric_match(bs, ["cash", "cash & bank", "cash and bank"]).values())
         cash_latest = cash[-1] if cash else 0
 
+        shares_norm = normalize_shares(shares_outstanding)
         ev = None
-        if price and shares_outstanding:
-            mcap = price * shares_outstanding / 1e7  # in Cr
+        if price and shares_norm:
+            mcap = price * shares_norm / 1e7  # in Cr
             ev = mcap + (debt_latest or 0) - (cash_latest or 0)
 
         earnings_yield = None
@@ -1488,11 +1533,12 @@ def valuation_engine(eps, bvps, current_price, rev_cagr, pro_cagr,
 
     # EV/EBITDA
     try:
-        if ebitda_val and ebitda_val > 0 and shares_outstanding and shares_outstanding > 0:
+        shares_norm = normalize_shares(shares_outstanding)
+        if ebitda_val and ebitda_val > 0 and shares_norm and shares_norm > 0:
             EVX  = 14
             debt = total_debt or 0
             c    = cash or 0
-            fair_price = ((EVX * ebitda_val - debt + c) * 1e7) / shares_outstanding
+            fair_price = ((EVX * ebitda_val - debt + c) * 1e7) / shares_norm
             results["EV/EBITDA"] = {
                 "iv": round(fair_price, 2),
                 "formula": f"14x × EBITDA {ebitda_val:.0f}Cr − Debt + Cash / shares",
@@ -1574,6 +1620,45 @@ def analyze_full(company_name, slug, sheets, biz_info):
     latest_int_cov = lv(int_cov)
     latest_nm_v    = lv(net_margin)
     latest_em_v    = lv(ebitda_mrg)
+
+    # ── Fallback: compute EPS, P/E, ROE, ROCE directly from raw data if computed ratios are missing ──
+    if latest_eps_v is None and profit and shares_ser:
+        np_latest = lv(profit)
+        sh_latest = lv(shares_ser)
+        if np_latest and sh_latest:
+            sh_norm = normalize_shares(sh_latest)
+            if sh_norm:
+                latest_eps_v = round(np_latest / (sh_norm / 1e7), 2)
+    if latest_bvps_v is None and shares_ser and reserves:
+        eq_sc = get_metric(sheets, ["balance","sheet"], ["equity share capital","equity capital","share capital"])[1]
+        eq_val = (lv(eq_sc) or 0) + (lv(reserves) or 0)
+        sh_latest = lv(shares_ser)
+        if eq_val > 0 and sh_latest:
+            sh_norm = normalize_shares(sh_latest)
+            if sh_norm:
+                latest_bvps_v = round(eq_val / (sh_norm / 1e7), 2)
+    if latest_pe_v is None and latest_eps_v and latest_price_v and latest_eps_v > 0:
+        latest_pe_v = round(latest_price_v / latest_eps_v, 1)
+    if latest_roe_v is None and profit and reserves:
+        eq_sc = get_metric(sheets, ["balance","sheet"], ["equity share capital","equity capital","share capital"])[1]
+        np_latest = lv(profit)
+        eq_latest = (lv(eq_sc) or 0) + (lv(reserves) or 0)
+        if np_latest and eq_latest > 0:
+            latest_roe_v = round((np_latest / eq_latest) * 100, 1)
+    if latest_roce_v is None and ebitda and borrowings and reserves:
+        eq_sc = get_metric(sheets, ["balance","sheet"], ["equity share capital","equity capital","share capital"])[1]
+        op_latest = lv(ebitda)
+        eq_latest = (lv(eq_sc) or 0) + (lv(reserves) or 0)
+        debt_latest = lv(borrowings) or 0
+        capital_employed = eq_latest + debt_latest
+        if op_latest and capital_employed > 0:
+            latest_roce_v = round((op_latest / capital_employed) * 100, 1)
+    if latest_de_v is None and borrowings and reserves:
+        eq_sc = get_metric(sheets, ["balance","sheet"], ["equity share capital","equity capital","share capital"])[1]
+        eq_latest = (lv(eq_sc) or 0) + (lv(reserves) or 0)
+        debt_latest = lv(borrowings)
+        if debt_latest and eq_latest > 0:
+            latest_de_v = round(debt_latest / eq_latest, 2)
 
     # ── Prefer Meta Current Price over historical PRICE ──
     meta = sheets.get("Meta", {}).get("data", {}).get("Meta", {})
@@ -1981,6 +2066,69 @@ def analyze_route():
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         resp.headers["Pragma"] = "no-cache"
         return resp
+    except Exception as e:
+        import traceback
+        resp = jsonify({"error": str(e), "trace": traceback.format_exc()})
+        resp.headers["Cache-Control"] = "no-store"
+        return resp, 500
+
+
+@app.route("/api/analyze/excel", methods=["POST"])
+def analyze_excel():
+    """Analyze from uploaded Screener.in Excel file."""
+    try:
+        if 'file' not in request.files:
+            return jsonify({"error": "No file uploaded"}), 400
+
+        file = request.files['file']
+        if not file.filename:
+            return jsonify({"error": "Empty file"}), 400
+
+        if not file.filename.endswith(('.xlsx', '.xls')):
+            return jsonify({"error": "Please upload an Excel file (.xlsx or .xls)"}), 400
+
+        # Read Excel file
+        excel_bytes = file.read()
+        if len(excel_bytes) < 1000:
+            return jsonify({"error": "Invalid or empty Excel file"}), 400
+
+        # Parse Excel
+        sheets = parse_excel(BytesIO(excel_bytes))
+
+        if not sheets:
+            return jsonify({"error": "Could not parse Excel file. Make sure it's a valid Screener.in export."}), 400
+
+        # Try to extract company info
+        meta = sheets.get("Meta", {}).get("data", {}).get("Meta", {})
+        company_name = meta.get("Company Name") or "Unknown"
+        industry = meta.get("Industry") or "Unknown"
+
+        # Get business info
+        biz_info = {
+            "industry": industry,
+            "description": meta.get("Description", ""),
+            "market_cap": meta.get("Market Cap"),
+            "promoter_holding": meta.get("Promoter Holding"),
+            "institutional_holding": meta.get("Institutional Holding"),
+        }
+
+        # If no company name from Meta, try to get from filename
+        if company_name == "Unknown":
+            company_name = file.filename.replace('.xlsx', '').replace('.xls', '').replace('_', ' ').strip()
+            if company_name.lower().endswith('consolidated'):
+                company_name = company_name[:-12].strip()
+
+        # Generate slug from company name
+        slug = company_name.lower().replace(' ', '-').replace('.', '').replace('(', '').replace(')', '')
+
+        # Run analysis
+        result = analyze_full(company_name, slug, sheets, biz_info)
+
+        resp = jsonify(result)
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        resp.headers["Pragma"] = "no-cache"
+        return resp
+
     except Exception as e:
         import traceback
         resp = jsonify({"error": str(e), "trace": traceback.format_exc()})
