@@ -612,7 +612,7 @@ def entry_zones(latest_price, val_info):
 def magic_formula_rank(key, pl, bs, price, shares_outstanding):
     """Compute Magic Formula (ROCE rank + Earnings Yield rank) for value investing."""
     try:
-        roce_vals = list(key.get("ROCE", {}).values())
+        roce_vals = list(key.get("ROE", {}).values())
         roce_latest = roce_vals[-1] if roce_vals else None
         # Earnings Yield = EBIT / Enterprise Value
         ebit = metric_match(key, ["ebitda"])
@@ -633,11 +633,18 @@ def magic_formula_rank(key, pl, bs, price, shares_outstanding):
         if ebit_latest and ev and ev > 0:
             earnings_yield = round(ebit_latest / ev * 100, 1)
 
+        formulas = {}
+        if roce_latest:
+            formulas["roce"] = f"ROCE = Operating Profit / (Equity + Borrowings)\n= EBIT / (Shareholders' Equity + Total Debt)"
+        if earnings_yield:
+            formulas["earnings_yield"] = f"Earnings Yield = EBIT / Enterprise Value\n= EBITDA / (Market Cap + Debt - Cash)"
+
         return {
             "roce": round(roce_latest, 1) if roce_latest else None,
             "earnings_yield": earnings_yield,
             "magic_formula_rank": "Value + Quality" if (roce_latest and roce_latest > 15 and earnings_yield and earnings_yield > 8) else "Quality" if (roce_latest and roce_latest > 15) else "Value" if (earnings_yield and earnings_yield > 8) else "Below Thresholds",
             "ev": round(ev, 2) if ev else None,
+            "formulas": formulas,
         }
     except:
         return {"roce": None, "earnings_yield": None}
@@ -1602,6 +1609,11 @@ def valuation_engine(eps, bvps, current_price, rev_cagr, pro_cagr,
     else:               v= ("HIGHLY OVERVALUED","danger",  "🔴 Significant downside risk")
 
     peg_actual = results.get("PEG Model", {}).get("peg_actual")
+    val_formulas = {}
+    for name, md in results.items():
+        key = f"val_{name.lower().replace(' ', '_').replace('(', '').replace(')', '').replace('/', '_')}"
+        val_formulas[key] = md.get("formula", "")
+    val_formulas["weighted_iv"] = f"Weighted Average:\n" + " + ".join([f"{m['weight']*100:.0f}% × ₹{m['iv']}" for m in results.values()])
     return {
         "models":        results,
         "weighted_iv":   wtd_iv,
@@ -1612,6 +1624,7 @@ def valuation_engine(eps, bvps, current_price, rev_cagr, pro_cagr,
         "val_class":     v[1],
         "val_verdict":   v[2],
         "peg_actual":    peg_actual,
+        "val_formulas":  val_formulas,
     }
 
 
@@ -2054,7 +2067,7 @@ def analyze_full(company_name, slug, sheets, biz_info):
 
         "risks": risks,
         "val": val,
-        "formulas": formulas,
+        "formulas": {**formulas, **(val.get("val_formulas") if val else {}), **(mf.get("formulas") if mf else {})},
         "scores": scores,
         "overall": overall,
         "verdict": verdict,

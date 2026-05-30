@@ -361,12 +361,9 @@
     .btn-pdf { width: 100%; justify-content: center; }
     .verdict-banner { flex-direction: column; text-align: center; padding: 16px; }
     .val-hero { grid-template-columns: 1fr 1fr; }
-    #results [style*="grid-template-columns: 1.8fr 1.5fr 2.5fr"] { grid-template-columns: 1fr 1fr !important; }
-    #results [style*="grid-template-columns: 1.8fr 1.5fr 2.5fr"] > div { font-size: 8px !important; }
   }
   @media(max-width:400px){
     .val-hero { grid-template-columns: 1fr; }
-    #results [style*="grid-template-columns: 1.8fr 1.5fr 2.5fr"] { grid-template-columns: 1fr !important; }
   }
 
   /* ── CARD ── */
@@ -483,6 +480,7 @@
   }
 
   @media(max-width:600px){ .val-hero { grid-template-columns: 1fr 1fr; } }
+  @media(max-width:400px){ .val-hero { grid-template-columns: 1fr; } }
 
   .val-stat {
     background: var(--bg3);
@@ -523,6 +521,21 @@
   .model-iv.red   { color: var(--red); }
   .model-formula  { font-size: 11px; color: var(--muted); font-family: 'DM Mono', monospace; line-height: 1.4; }
 
+  .val-model-header {
+    display: grid;
+    grid-template-columns: 2fr 1.5fr 3fr;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .val-model-header > div { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+
+  @media(max-width:600px){
+    .val-model-header { grid-template-columns: 1fr 1fr; }
+    .val-model-header > div:nth-child(3) { display: none; }
+    .model-row { grid-template-columns: 1fr 1fr; gap: 4px; }
+    .model-formula { grid-column: 1 / -1; font-size: 10px; }
+  }
+
   .val-verdict-strip {
     border-radius: 12px;
     padding: 16px 20px;
@@ -539,6 +552,27 @@
   .val-verdict-strip.fair    { background: rgba(245,158,11,0.08);border-color: rgba(245,158,11,0.3);color: var(--amber); }
   .val-verdict-strip.over,
   .val-verdict-strip.danger  { background: rgba(239,68,68,0.08); border-color: rgba(239,68,68,0.3); color: var(--red); }
+
+  .val-peg-box {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+    margin-bottom: 16px;
+    display: flex;
+    gap: 16px;
+    align-items: center;
+  }
+  .val-peg-label { font-family: 'DM Mono', monospace; font-size: 12px; color: var(--muted); }
+  .val-peg-value { font-family: 'Syne', sans-serif; font-size: 20px; font-weight: 800; }
+  .val-peg-value.green { color: var(--green); }
+  .val-peg-value.red { color: var(--red); }
+  .val-peg-desc { font-size: 13px; color: var(--muted); }
+
+  @media(max-width:600px){
+    .val-peg-box { flex-wrap: wrap; gap: 8px; }
+    .val-peg-desc { width: 100%; font-size: 11px; }
+  }
 
   /* ── ERROR ── */
   .error-box {
@@ -609,9 +643,31 @@
   .formula-overlay.active { display: flex; }
   .formula-popup {
     background: var(--bg2); border: 1px solid var(--border);
-    border-radius: 16px; padding: 28px 32px; max-width: 520px; width: 90%;
+    border-radius: 16px; padding: 28px 32px; max-width: 620px; width: 94%;
     box-shadow: 0 20px 60px rgba(0,0,0,0.5);
     animation: popIn .2s ease;
+  }
+  .formula-popup.checklist-popup {
+    max-width: 500px;
+    width: 90%;
+    padding: 24px 28px;
+  }
+  @media(max-width:600px){
+    .formula-popup { padding: 20px 16px; max-width: 95%; }
+    .formula-popup.checklist-popup { max-width: 96%; width: 96%; padding: 18px; }
+    .formula-popup-title { font-size: 15px; }
+    .formula-popup-body.checklist-body { font-size: 13px; }
+  }
+  .formula-popup-body.checklist-body {
+    font-family: 'DM Sans', sans-serif; font-size: 14px; line-height: 1.6;
+  }
+  .formula-popup-body.checklist-body .checklist-detail {
+    margin-top: 12px; padding: 12px; background: var(--bg3); border-radius: 8px;
+  }
+  .formula-popup-body.checklist-body .checklist-detail.pass { border-left: 3px solid var(--green); }
+  .formula-popup-body.checklist-body .checklist-detail.fail { border-left: 3px solid var(--red); }
+  @media(max-width:600px){
+    .formula-popup-body.checklist-body { font-size: 13px; }
   }
   @keyframes popIn {
     from { transform: scale(0.92); opacity: 0; }
@@ -636,14 +692,14 @@
     font-size: 11px; color: var(--muted); margin-top: 12px; padding-top: 10px;
     border-top: 1px solid var(--border); font-family: 'DM Sans', sans-serif;
   }
-  .metric-value.has-formula {
+  .metric-value.has-formula, .model-iv.has-formula {
     cursor: pointer; position: relative;
   }
-  .metric-value.has-formula::after {
+  .metric-value.has-formula::after, .model-iv.has-formula::after {
     content: '∑'; position: absolute; top: -2px; right: -8px;
     font-size: 9px; color: var(--acc); opacity: 0.5;
   }
-  .metric-value.has-formula:hover::after { opacity: 1; }
+  .metric-value.has-formula:hover::after, .model-iv.has-formula:hover::after { opacity: 1; }
   .checklist-item:hover { filter: brightness(1.3); transform: translateX(2px); }
   .checklist-item:active { transform: scale(0.99); }
 </style>
@@ -1325,29 +1381,30 @@ function renderResults(A) {
         </div>
       </div>
       ${val.peg_actual !== null && val.peg_actual !== undefined ? `
-        <div style="background:var(--bg3);border:1px solid var(--border);border-radius:10px;padding:12px 16px;margin-bottom:16px;display:flex;gap:16px;align-items:center">
-          <span style="font-family:'DM Mono',monospace;font-size:12px;color:var(--muted)">PEG RATIO</span>
-          <span style="font-family:'Syne',sans-serif;font-size:20px;font-weight:800;color:${val.peg_actual < 1 ? 'var(--green)' : 'var(--red)'}">${val.peg_actual.toFixed(2)}</span>
-          <span style="font-size:13px;color:var(--muted)">${val.peg_actual < 1 ? '✅ Below 1 — Undervalued on growth basis' : '⚠️ Above 1 — Paying premium for growth'}</span>
+        <div class="val-peg-box">
+          <span class="val-peg-label">PEG RATIO</span>
+          <span class="val-peg-value ${val.peg_actual < 1 ? 'green' : 'red'}">${val.peg_actual.toFixed(2)}</span>
+          <span class="val-peg-desc">${val.peg_actual < 1 ? '✅ Below 1 — Undervalued on growth basis' : '⚠️ Above 1 — Paying premium for growth'}</span>
         </div>` : ''}
-      <div style="display:grid;grid-template-columns:1.8fr 1.5fr 2.5fr;gap:8px;margin-bottom:8px">
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em">Model</div>
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em">Intrinsic Value</div>
-        <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em">Formula</div>
+      <div class="val-model-header">
+        <div>Model</div>
+        <div>Intrinsic Value</div>
+        <div>Formula</div>
       </div>
       ${Object.entries(val.models).map(([name, md]) => {
         const iv   = md.iv;
         const diff = iv - val.current_price;
         const cls  = diff > 0 ? 'green' : 'red';
+        const key = 'val_' + name.toLowerCase().replace(/\s+/g, '_').replace(/\(/g, '').replace(/\)/g, '').replace(/\//g, '_');
         return `<div class="model-row">
           <div class="model-name">${name}</div>
-          <div class="model-iv ${cls}">₹${iv.toLocaleString()}</div>
+          <div class="model-iv ${cls} has-formula" data-key="${key}">₹${iv.toLocaleString()}</div>
           <div class="model-formula">${md.formula}</div>
         </div>`;
       }).join('')}
       <div class="model-row total-row">
         <div class="model-name" style="color:var(--acc)">WEIGHTED INTRINSIC VALUE</div>
-        <div class="model-iv ${upColor}" style="font-size:18px">₹${val.weighted_iv.toLocaleString()}</div>
+        <div class="model-iv ${upColor} has-formula" data-key="weighted_iv" style="font-size:18px">₹${val.weighted_iv.toLocaleString()}</div>
         <div class="model-formula">Weighted average of all 5 models</div>
       </div>
       <div class="val-verdict-strip ${val.val_class}">${val.val_verdict}</div>
@@ -1727,6 +1784,7 @@ function showFormula(key) {
   if (!f) return;
   const title = key.replace('latest_','').replace(/_/g,' ').toUpperCase().replace(/CAGR/g,'CAGR');
   document.getElementById('formulaTitle').textContent = title;
+  document.getElementById('formulaBody').className = 'formula-popup-body';
   document.getElementById('formulaBody').innerHTML = `<div style="font-family:'DM Mono',monospace;font-size:13px;line-height:1.8;white-space:pre-wrap">${escHtml(f)}</div>`;
   document.getElementById('formulaOverlay').classList.add('active');
 }
@@ -1739,27 +1797,29 @@ function showChecklistDetail(idx) {
     ? '<span style="color:var(--green);font-weight:700">✅ PASS</span>'
     : '<span style="color:var(--red);font-weight:700">❌ FAIL</span>';
   document.getElementById('formulaTitle').textContent = `#${item.point} — ${item.category}`;
+  document.getElementById('formulaBody').className = 'formula-popup-body checklist-body';
+  document.querySelector('.formula-popup').classList.add('checklist-popup');
   document.getElementById('formulaBody').innerHTML = `
-    <div style="display:flex;flex-direction:column;gap:16px">
-      <div>
-        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Question</div>
-        <div style="font-size:14px;color:var(--text);font-weight:600">${escHtml(item.question)}</div>
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <div style="display:flex;flex-direction:column;gap:4px">
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em">Question</div>
+        <div style="font-size:15px;color:var(--text);font-weight:600;line-height:1.4">${escHtml(item.question)}</div>
       </div>
-      <div>
-        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Verdict</div>
-        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <div style="display:flex;flex-direction:column;gap:4px">
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em">Verdict</div>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
           ${passStr}
           <span style="font-size:11px;color:var(--muted)">${wMap[item.weight] || item.weight} importance</span>
         </div>
       </div>
-      <div>
-        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Data Checked</div>
+      <div style="display:flex;flex-direction:column;gap:4px">
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em">Data Checked</div>
         <div style="font-size:13px;color:${item.pass ? 'var(--green)' : 'var(--red)'};line-height:1.5">${escHtml(item.detail)}</div>
       </div>
       ${item.reason ? `
-      <div style="background:var(--bg3);border-radius:10px;padding:14px 16px;border:1px solid var(--border)">
+      <div style="background:var(--bg3);border-radius:10px;padding:14px 16px;border:1px solid var(--border);margin-top:4px">
         <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Why?</div>
-        <div style="font-size:12px;color:var(--text);line-height:1.7">${escHtml(item.reason)}</div>
+        <div style="font-size:13px;color:var(--text);line-height:1.6">${escHtml(item.reason)}</div>
       </div>` : ''}
     </div>`;
   document.getElementById('formulaOverlay').classList.add('active');
@@ -1767,6 +1827,7 @@ function showChecklistDetail(idx) {
 
 function hideFormula() {
   document.getElementById('formulaOverlay').classList.remove('active');
+  document.querySelector('.formula-popup').classList.remove('checklist-popup');
 }
 
 function escHtml(s) {
