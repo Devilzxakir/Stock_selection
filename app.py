@@ -24,7 +24,7 @@ from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 app = Flask(__name__)
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-SESSION_ID = "wd45cahfg2g5q6tqyabmkfw7zjih1bbb"   # ← update when expired
+SESSION_ID = os.environ.get("SESSION_ID", "wd45cahfg2g5q6tqyabmkfw7zjih1bbb")
 BASE       = "https://www.screener.in"
 HEADERS    = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -1037,22 +1037,26 @@ def twenty_point_checklist(analyze_result):
     checklist = []
 
     # 1. Business Understanding
+    bm_pass = bool(b.get("industry") and b.get("description") and len(b.get("description", "")) > 20)
     checklist.append({
         "point": 1, "category": "Business Model",
         "question": "Do you understand what the company does?",
-        "pass": bool(b.get("industry") and b.get("description") and len(b.get("description", "")) > 20),
+        "pass": bm_pass,
         "detail": b.get("description", "N/A")[:100] + "..." if b.get("description") else "No description available",
-        "weight": "high"
+        "weight": "high",
+        "reason": f"Industry: {b.get('industry', 'N/A')}. Description available: {'Yes ✅' if b.get('description') else 'No ❌'}. {'You can understand the business model clearly.' if bm_pass else 'Cannot evaluate — insufficient business description.'}"
     })
 
     # 2. Revenue Growth
     rev_cagr = m.get("rev_cagr")
+    rev_pass = rev_cagr is not None and rev_cagr > 5
     checklist.append({
         "point": 2, "category": "Revenue Growth",
         "question": "Is revenue growing consistently?",
-        "pass": rev_cagr is not None and rev_cagr > 5,
+        "pass": rev_pass,
         "detail": f"Revenue CAGR: {rev_cagr:.1f}%" if rev_cagr else "Insufficient data",
-        "weight": "high"
+        "weight": "high",
+        "reason": f"Revenue CAGR: {rev_cagr:.1f}% (threshold: >5%). {'✅ Growing above threshold — consistent revenue expansion.' if rev_pass else '❌ Below 5% threshold — weak or negative revenue growth.'}" if rev_cagr else "Insufficient revenue data to evaluate growth."
     })
 
     # 3. Profit Growth
@@ -1060,65 +1064,77 @@ def twenty_point_checklist(analyze_result):
     rev_cagr_val = rev_cagr or 0
     pro_cagr_val = pro_cagr or 0
     profit_faster = pro_cagr_val > rev_cagr_val if rev_cagr is not None and pro_cagr is not None else None
+    pro_pass = pro_cagr is not None and pro_cagr > 5
     checklist.append({
         "point": 3, "category": "Profit Growth",
         "question": "Are profits growing? Is profit growing faster than revenue?",
-        "pass": pro_cagr is not None and pro_cagr > 5,
+        "pass": pro_pass,
         "detail": f"Profit CAGR: {pro_cagr:.1f}%{' — Growing faster than revenue ✅' if profit_faster else ''}" if pro_cagr else "Insufficient data",
-        "weight": "high"
+        "weight": "high",
+        "reason": f"Profit CAGR: {pro_cagr:.1f}% (threshold: >5%). {'✅ Strong profit growth.' if pro_pass else '❌ Below 5% threshold.'} {'Revenue CAGR: ' + str(rev_cagr) + '%.' if rev_cagr else ''} {'Profits growing faster than revenue — improving margins ✅.' if profit_faster else 'Revenue growing faster than profits — margin pressure ⚠️.' if profit_faster is False else ''}" if pro_cagr else "Insufficient profit data to evaluate."
     })
 
     # 4. Debt Analysis
     latest_de = m.get("latest_de")
+    de_pass = latest_de is not None and latest_de < 1
     checklist.append({
         "point": 4, "category": "Debt Analysis",
         "question": "Is debt level safe? (D/E below 1 is ideal)",
-        "pass": latest_de is not None and latest_de < 1,
+        "pass": de_pass,
         "detail": f"Debt/Equity: {latest_de:.2f}x{' — Below 1 ✅' if latest_de and latest_de < 1 else ' — Above 1 ⚠️' if latest_de else ''}" if latest_de else "Insufficient data",
-        "weight": "high"
+        "weight": "high",
+        "reason": f"D/E Ratio: {latest_de:.2f}x (threshold: <1.0x). {'✅ Low debt — financially stable.' if de_pass else '❌ D/E above 1 — elevated debt risk.'} {'Healthy balance sheet with manageable leverage.' if latest_de and latest_de < 0.5 else 'Moderate debt levels — monitor closely.' if latest_de and latest_de < 1 else 'High debt — interest burden may impact profits.' if latest_de and latest_de >= 1 else ''}" if latest_de else "Insufficient debt data to evaluate."
     })
 
     # 5. Cash Flow Analysis
     cfo_pos = m.get("cfo_positive")
     fcf_series = analyze_result.get("series", {}).get("fcf", [])
     latest_fcf = fcf_series[-1]["value"] if fcf_series else None
+    cf_pass = cfo_pos is True
     checklist.append({
         "point": 5, "category": "Cash Flow",
         "question": "Is company generating real cash? Is FCF positive?",
-        "pass": cfo_pos is True,
+        "pass": cf_pass,
         "detail": "Operating cash flow is positive ✅" if cfo_pos else "Operating cash flow is negative 🚨" if cfo_pos is False else "Insufficient data",
-        "weight": "high"
+        "weight": "high",
+        "reason": f"Operating Cash Flow: {'Positive ✅ — company generates real cash from operations.' if cf_pass else 'Negative 🚨 — company burns cash, may need external funding.' if cfo_pos is False else 'Data unavailable.'} {'Cash from operations exceeds net profit — earnings quality is good.' if cf_pass else 'Negative CFO is a major red flag for long-term survival.' if cfo_pos is False else ''}"
     })
 
     # 6. ROE
     latest_roe = m.get("latest_roe")
+    roe_pass = latest_roe is not None and latest_roe > 15
     checklist.append({
         "point": 6, "category": "ROE",
         "question": "Is ROE above 15%?",
-        "pass": latest_roe is not None and latest_roe > 15,
+        "pass": roe_pass,
         "detail": f"ROE: {latest_roe:.1f}%{' — Above 15% ✅' if latest_roe and latest_roe > 15 else ''}" if latest_roe else "Insufficient data",
-        "weight": "medium"
+        "weight": "medium",
+        "reason": f"ROE: {latest_roe:.1f}% (threshold: >15%). {'✅ Strong return on equity — management generates good profits from shareholder capital.' if roe_pass else '❌ Below 15% threshold — capital efficiency needs improvement.'} {'ROE > 20% indicates a strong competitive advantage.' if latest_roe and latest_roe > 20 else ''}" if latest_roe else "Insufficient data to calculate ROE."
     })
 
     # 7. ROCE
     latest_roce = m.get("latest_roce")
+    roce_pass = latest_roce is not None and latest_roce > 15
     checklist.append({
         "point": 7, "category": "ROCE",
         "question": "Is ROCE above 15%?",
-        "pass": latest_roce is not None and latest_roce > 15,
+        "pass": roce_pass,
         "detail": f"ROCE: {latest_roce:.1f}%{' — Above 15% ✅' if latest_roce and latest_roce > 15 else ''}" if latest_roce else "Insufficient data",
-        "weight": "medium"
+        "weight": "medium",
+        "reason": f"ROCE: {latest_roce:.1f}% (threshold: >15%). {'✅ Efficient use of capital — company earns good returns on total capital employed.' if roce_pass else '❌ Below 15% threshold — capital efficiency below ideal.'} {'ROCE > 20% indicates a strong moat.' if latest_roce and latest_roce > 20 else ''}" if latest_roce else "Insufficient data to calculate ROCE."
     })
 
     # 8. Valuation
     latest_pe = m.get("latest_pe")
     upside = val.get("upside_pct") if val else None
+    val_pass = (upside is not None and upside > 0) or (latest_pe is not None and latest_pe < 25)
     checklist.append({
         "point": 8, "category": "Valuation",
         "question": "Is valuation reasonable? (P/E reasonable, upside positive)",
-        "pass": (upside is not None and upside > 0) or (latest_pe is not None and latest_pe < 25),
+        "pass": val_pass,
         "detail": f"P/E: {latest_pe:.1f}x, Upside: {upside:+.1f}%" if latest_pe and upside is not None else f"P/E: {latest_pe:.1f}x" if latest_pe else "Insufficient data",
-        "weight": "high"
+        "weight": "high",
+        "reason": f"P/E: {latest_pe:.1f}x | Intrinsic upside: {upside:+.1f}% (threshold: >0% or P/E <25x). {'✅ Valuation is reasonable — upside potential or reasonable P/E.' if val_pass else '❌ Stock appears overvalued — limited margin of safety.'}" if latest_pe and upside is not None else "Insufficient pricing data for full valuation assessment."
     })
 
     # 9. Competitive Advantage (Moat)
@@ -1128,121 +1144,146 @@ def twenty_point_checklist(analyze_result):
     if latest_roce and latest_roce > 20: moat_score += 1
     if opm and opm > 20: moat_score += 1
     if pf.get("score") and pf["score"] >= 7: moat_score += 1
+    moat_pass = moat_score >= 2
     checklist.append({
         "point": 9, "category": "Competitive Moat",
         "question": "Does company have a durable competitive advantage?",
-        "pass": moat_score >= 2,
+        "pass": moat_pass,
         "detail": f"High ROE/ROCE/OPM ({moat_score}/4 indicators positive)" if moat_score >= 2 else "Limited moat indicators",
-        "weight": "medium"
+        "weight": "medium",
+        "reason": f"Moat Score: {moat_score}/4 indicators positive. Components — ROE>20%: {'✅' if latest_roe and latest_roe > 20 else '❌'} ({latest_roe:.1f}%), ROCE>20%: {'✅' if latest_roce and latest_roce > 20 else '❌'} ({latest_roce:.1f}%), OPM>20%: {'✅' if opm and opm > 20 else '❌'} ({opm:.1f}%), Piotroski≥7: {'✅' if pf.get('score') and pf['score'] >= 7 else '❌'} ({pf.get('score', 'N/A')}/9). {'✅ Company shows signs of a competitive moat.' if moat_pass else '❌ Limited evidence of durable competitive advantage.'}"
     })
 
     # 10. Management Quality
     mgmt = assess_management_quality(b.get("promoter_holding"), bs_data.get("debt_trend"), latest_roce, latest_roe)
+    mgmt_pass = mgmt["score"] >= 7
     checklist.append({
         "point": 10, "category": "Management Quality",
         "question": "Is management trustworthy with good capital allocation?",
-        "pass": mgmt["score"] >= 7,
+        "pass": mgmt_pass,
         "detail": f"Score: {mgmt['score']}/10 — {mgmt['label']}" if mgmt["reasons"] else "Based on available indicators",
-        "weight": "high"
+        "weight": "high",
+        "reason": f"Management Score: {mgmt['score']}/10. {'✅ Management appears capable with good capital allocation.' if mgmt_pass else '❌ Management quality concerns.'} {'Promoter holding: ' + str(b.get('promoter_holding', 'N/A')) + '%.' if b.get('promoter_holding') else ''} {'Debt trend: ' + bs_data.get('debt_trend', 'N/A') + '.' if bs_data.get('debt_trend') else ''} {'ROCE: ' + str(latest_roce) + '%, ROE: ' + str(latest_roe) + '%.' if latest_roce and latest_roe else ''}"
     })
 
     # 11. Promoter Holding
     promoter = b.get("promoter_holding")
+    prom_pass = promoter is not None and promoter > 50
     checklist.append({
         "point": 11, "category": "Promoter Holding",
         "question": "Is promoter holding high and stable?",
-        "pass": promoter is not None and promoter > 50,
+        "pass": prom_pass,
         "detail": f"Promoter holding: {promoter:.1f}%" if promoter else "Insufficient data",
-        "weight": "medium"
+        "weight": "medium",
+        "reason": f"Promoter Holding: {promoter:.1f}% (threshold: >50%). {'✅ High promoter stake — management is aligned with shareholders.' if prom_pass else '❌ Below 50% — low promoter confidence.'} {'Holding >60% indicates strong promoter conviction.' if promoter and promoter > 60 else ''}" if promoter else "Insufficient promoter data."
     })
 
     # 12. Industry Future
     industry_future = assess_industry_future(b.get("industry"))
+    ind_pass = industry_future["score"] >= 7
     checklist.append({
         "point": 12, "category": "Industry Future",
         "question": "Is the industry growing? (AI, Semi, Pharma, Defense, etc.)",
-        "pass": industry_future["score"] >= 7,
+        "pass": ind_pass,
         "detail": industry_future["detail"],
-        "weight": "medium"
+        "weight": "medium",
+        "reason": f"Industry: {b.get('industry', 'N/A')}. Assessment: {industry_future['label']} (Score: {industry_future['score']}/10). {'✅ Company operates in a growing/favorable industry.' if ind_pass else '❌ Industry outlook is neutral or challenging.'} {'Growing industries provide tailwinds for revenue expansion.' if industry_future['score'] >= 7 else 'Mature/declining industries face headwinds for growth.'}"
     })
 
     # 13. Market Position
     market_pos = assess_market_position(b.get("market_cap"), b.get("industry"))
+    mkt_pass = market_pos["score"] >= 7
     checklist.append({
         "point": 13, "category": "Market Position",
         "question": "Is company a market leader or gaining share?",
-        "pass": market_pos["score"] >= 7,
+        "pass": mkt_pass,
         "detail": market_pos["detail"],
-        "weight": "medium"
+        "weight": "medium",
+        "reason": f"Market Cap: {'₹' + str(b.get('market_cap', '')) + 'Cr' if b.get('market_cap') else 'N/A'}. Assessment: {market_pos['label']} (Score: {market_pos['score']}/10). {'✅ Strong market position — likely has pricing power.' if mkt_pass else '❌ Limited market presence — may lack pricing power.'}"
     })
 
     # 14. Technical Analysis (entry timing)
+    ent_pass = upside is not None and upside > 0
     checklist.append({
         "point": 14, "category": "Entry Timing",
         "question": "Is the entry price favorable based on valuation zones?",
-        "pass": upside is not None and upside > 0,
+        "pass": ent_pass,
         "detail": f"Entry recommendation: {val.get('val_verdict', 'N/A')}" if val else "Insufficient data",
-        "weight": "low"
+        "weight": "low",
+        "reason": f"Upside: {upside:+.1f}% | Intrinsic Value: ₹{val.get('weighted_iv', 'N/A')} | Current Price: ₹{val.get('current_price', 'N/A')}. {'✅ Entry price is favorable — margin of safety exists.' if ent_pass else '❌ Stock is overvalued — wait for better entry.'} Valuation verdict: {val.get('val_verdict', 'N/A')}." if val else "Insufficient data for entry timing analysis."
     })
 
     # 15. Risk Analysis
     risk_count = len(analyze_result.get("risks", []))
+    risk_pass = risk_count <= 2
     checklist.append({
         "point": 15, "category": "Risk Assessment",
         "question": "What can go wrong? Are risks manageable?",
-        "pass": risk_count <= 2,
+        "pass": risk_pass,
         "detail": f"{risk_count} risk factor(s) identified" if risk_count > 1 else "No major risks identified" if risk_count == 1 else "Clean risk profile",
-        "weight": "high"
+        "weight": "high",
+        "reason": f"Risk factors identified: {risk_count} (threshold: ≤2). {'✅ Risk profile is clean/acceptable.' if risk_pass else '❌ Too many risk factors — proceed with caution.'} Risks: {', '.join(analyze_result.get('risks', [])) if analyze_result.get('risks') else 'None identified.'}"
     })
 
     # 16. Dividend History
     div = assess_dividend_history(m.get("latest_eps"), analyze_result.get("series", {}).get("profit", []))
+    div_pass = div["score"] >= 7
     checklist.append({
         "point": 16, "category": "Dividend History",
         "question": "Does company have consistent dividend payments?",
-        "pass": div["score"] >= 7,
+        "pass": div_pass,
         "detail": div["detail"],
-        "weight": "low"
+        "weight": "low",
+        "reason": f"Dividend Assessment: {div['label'] if 'label' in div else 'N/A'} (Score: {div['score']}/10). {'✅ Consistent dividend history — income investors may find this attractive.' if div_pass else '❌ Inconsistent or no dividend payments.'} {'Dividends indicate management confidence in cash flows.' if div_pass else 'Growth companies often reinvest profits rather than pay dividends.'}"
     })
 
     # 17. Economic Conditions sensitivity
     econ = assess_economic_sensitivity(b.get("industry"), latest_de, m.get("interest_coverage"))
+    econ_pass = econ["score"] >= 6
     checklist.append({
         "point": 17, "category": "Economic Resilience",
         "question": "Can business withstand inflation, high interest rates, recession?",
-        "pass": econ["score"] >= 6,
+        "pass": econ_pass,
         "detail": f"{econ['label']} (Score: {econ['score']}/10)",
-        "weight": "medium"
+        "weight": "medium",
+        "reason": f"Economic Sensitivity: {econ['label']} (Score: {econ['score']}/10, threshold: ≥6). {'✅ Business is resilient to economic cycles.' if econ_pass else '❌ Highly sensitive to economic downturns.'} {'Low debt and essential-demand products provide stability.' if econ_pass else 'High cyclical exposure and/or debt increases vulnerability.'} Warnings: {', '.join(econ.get('warnings', [])) if econ.get('warnings') else 'None.'}"
     })
 
     # 18. Long-Term Growth Potential
     multibagger = lt.get("multibagger_possibility", "Low")
+    lt_pass = multibagger in ("High", "Moderate")
     checklist.append({
         "point": 18, "category": "Long-Term Growth",
         "question": "Can company become 2x-10x bigger in 5-10 years?",
-        "pass": multibagger in ("High", "Moderate"),
+        "pass": lt_pass,
         "detail": f"Multibagger potential: {multibagger}",
-        "weight": "medium"
+        "weight": "medium",
+        "reason": f"Long-Term Potential: {multibagger}. {'✅ Strong long-term wealth creation potential.' if multibagger == 'High' else '⚠️ Moderate potential — decent but not exceptional.' if multibagger == 'Moderate' else '❌ Limited long-term growth prospects.'} {'High growth + low debt = multibagger formula.' if multibagger == 'High' else 'Growth prospects are limited by market size or competition.' if multibagger == 'Low' else ''}"
     })
 
     # 19. Institutional Buying
     inst = b.get("institutional_holding")
+    inst_pass = inst is not None and inst > 10
     checklist.append({
         "point": 19, "category": "Institutional Interest",
         "question": "Are mutual funds, FIIs, DIIs increasing holdings?",
-        "pass": inst is not None and inst > 10,
+        "pass": inst_pass,
         "detail": f"Institutional holding: {inst:.1f}%" if inst else "Insufficient data",
-        "weight": "low"
+        "weight": "low",
+        "reason": f"Institutional Holding: {inst:.1f}% (threshold: >10%). {'✅ Meaningful institutional presence — professional investors see value.' if inst_pass else '❌ Low institutional interest — may indicate governance or growth concerns.'} {'High institutional holding often correlates with better governance.' if inst and inst > 20 else ''}" if inst else "Insufficient institutional data."
     })
 
     # 20. Red Flags
     red_flags = analyze_result.get("red_flags", {}).get("red_flags", [])
+    rf_pass = len(red_flags) == 0
+    rf_detail_list = [f"{f['flag']}: {f['detail']}" for f in red_flags] if red_flags else []
     checklist.append({
         "point": 20, "category": "Red Flags",
         "question": "Are there any major red flags? (Fraud, losses, debt, negative cash flow)",
-        "pass": len(red_flags) == 0,
+        "pass": rf_pass,
         "detail": f"{len(red_flags)} red flag(s) detected" if red_flags else "No red flags — Clean 🟢",
-        "weight": "high"
+        "weight": "high",
+        "reason": f"Red Flags: {len(red_flags)} detected (threshold: 0). {'✅ No red flags — company appears clean.' if rf_pass else '❌ Red flags present — investigate before investing.'} {'Details: ' + ' | '.join(rf_detail_list) if rf_detail_list else ''}"
     })
 
     # Calculate overall pass rate
@@ -1578,7 +1619,7 @@ def valuation_engine(eps, bvps, current_price, rev_cagr, pro_cagr,
 # COMPREHENSIVE ANALYSIS ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def series_list(s, n=8):
+def series_list(s, n=12):
     if not s: return []
     ks = list(s.keys())[-n:]
     return [{"year": k, "value": s[k]} for k in ks]
@@ -1605,6 +1646,15 @@ def analyze_full(company_name, slug, sheets, biz_info):
     _, int_cov    = get_metric(sheets, ["ratio","key"], ["interest coverage"])
     _, net_margin = get_metric(sheets, ["ratio","key","profit"], ["net margin"])
     _, ebitda_mrg = get_metric(sheets, ["ratio","key","profit"], ["ebitda margin"])
+
+    # ── Quarterly data for Historical Trends ──
+    qdata = sheets.get("Quarters", {}).get("data", {})
+    q_sales      = metric_match(qdata, ["sales","revenue","net sales"])
+    q_profit     = metric_match(qdata, ["net profit","profit after"])
+    q_ebitda     = metric_match(qdata, ["ebitda","operating profit"])
+    q_borrowings = metric_match(qdata, ["borrowings","debt","total debt"])
+    q_reserves   = metric_match(qdata, ["reserves"])
+    q_cfo        = metric_match(qdata, ["operating","from operations"])
 
     # ── Latest values ──
     rev_cagr_v     = cagr(fv(sales), lv(sales), yrs(sales)) if sales else None
@@ -1827,6 +1877,99 @@ def analyze_full(company_name, slug, sheets, biz_info):
     else:
         bbb = None
 
+    # ── Formula strings for double-click display ──
+    formulas = {}
+    pl_raw = sheets.get("Profit & Loss", {}).get("data", {})
+    bs_raw = sheets.get("Balance Sheet", {}).get("data", {})
+
+    # Get operating profit for formulas
+    op_ser = metric_match(pl_raw, ["operating profit"])
+    op_val = lv(op_ser)
+    if op_val is None:
+        pbt_s = metric_match(pl_raw, ["profit before tax", "pbt"])
+        int_s_ = metric_match(pl_raw, ["interest"])
+        dep_s = metric_match(pl_raw, ["depreciation", "dep"])
+        oi_s_ = metric_match(pl_raw, ["other income"])
+        p_v, i_v, d_v = lv(pbt_s), lv(int_s_), lv(dep_s)
+        if p_v is not None and i_v is not None and d_v is not None:
+            op_val = p_v + i_v + d_v
+            oi_v_ = lv(oi_s_)
+            if oi_v_ is not None: op_val -= oi_v_
+
+    # Interest for coverage formula
+    int_cov_raw = lv(metric_match(pl_raw, ["interest"]))
+
+    # Equity for formulas
+    eq_sc_f = get_metric(sheets, ["balance","sheet"], ["equity share capital","equity capital","share capital"])[1]
+    eq_sc_v = lv(eq_sc_f) or 0
+    res_v = lv(reserves) or 0
+    eq_v = eq_sc_v + res_v
+
+    # Normalized shares for formulas
+    sh_norm_f = normalize_shares(shares_units) if shares_units else None
+
+    def _cr(x):
+        return f"₹{x:.1f}Cr" if x is not None else "N/A"
+
+    # Revenue CAGR
+    if sales and lv(sales) and fv(sales) and yrs(sales) > 0:
+        f_s, l_s, ny = fv(sales), lv(sales), yrs(sales)
+        formulas["rev_cagr"] = f"CAGR = ((Latest / First)^(1/Years) - 1) × 100\n= (({l_s:.1f} / {f_s:.1f})^(1/{ny}) - 1) × 100 = {rev_cagr_v}%"
+
+    # Profit CAGR
+    if profit and lv(profit) and fv(profit) and yrs(profit) > 0:
+        f_p, l_p, ny = fv(profit), lv(profit), yrs(profit)
+        formulas["pro_cagr"] = f"CAGR = ((Latest / First)^(1/Years) - 1) × 100\n= (({l_p:.1f} / {f_p:.1f})^(1/{ny}) - 1) × 100 = {pro_cagr_v}%"
+
+    # EPS CAGR
+    if eps_ser and lv(eps_ser) and fv(eps_ser) and yrs(eps_ser) > 0:
+        eps_cagr_v = cagr(fv(eps_ser), lv(eps_ser), yrs(eps_ser))
+        f_e, l_e, ny = fv(eps_ser), lv(eps_ser), yrs(eps_ser)
+        formulas["eps_cagr"] = f"CAGR = ((Latest EPS / First EPS)^(1/Years) - 1) × 100\n= ((₹{l_e:.2f} / ₹{f_e:.2f})^(1/{ny}) - 1) × 100 = {eps_cagr_v}%"
+
+    # OPM
+    if latest_opm_v is not None and op_val is not None and lv(sales):
+        s_v = lv(sales)
+        formulas["latest_opm"] = f"OPM = (Operating Profit / Revenue) × 100\n= ({_cr(op_val)} / {_cr(s_v)}) × 100 = {latest_opm_v}%"
+
+    # Net Margin
+    if latest_nm_v is not None and lv(profit) and lv(sales):
+        formulas["net_margin"] = f"Net Margin = (Net Profit / Revenue) × 100\n= ({_cr(lv(profit))} / {_cr(lv(sales))}) × 100 = {latest_nm_v}%"
+
+    # EBITDA Margin
+    if latest_em_v is not None and lv(ebitda) and lv(sales):
+        formulas["ebitda_margin"] = f"EBITDA Margin = (EBITDA / Revenue) × 100\n= ({_cr(lv(ebitda))} / {_cr(lv(sales))}) × 100 = {latest_em_v}%"
+
+    # ROE
+    if latest_roe_v is not None and lv(profit) and eq_v > 0:
+        formulas["latest_roe"] = f"ROE = (Net Profit / Shareholders' Equity) × 100\n= ({_cr(lv(profit))} / {_cr(eq_v)}) × 100 = {latest_roe_v}%"
+
+    # ROCE
+    if latest_roce_v is not None and op_val is not None:
+        debt_v = lv(borrowings) or 0
+        ce_val = eq_v + debt_v
+        formulas["latest_roce"] = f"ROCE = (Operating Profit / (Equity + Borrowings)) × 100\n= ({_cr(op_val)} / ({_cr(eq_v)} + {_cr(debt_v)})) × 100 = {latest_roce_v}%"
+
+    # P/E
+    if latest_pe_v is not None and latest_price_v and latest_eps_v and latest_eps_v > 0:
+        formulas["latest_pe"] = f"P/E = Price / EPS\n= (₹{latest_price_v:.2f} / ₹{latest_eps_v:.2f}) = {latest_pe_v}x"
+
+    # D/E
+    if latest_de_v is not None and lv(borrowings) is not None and eq_v > 0:
+        formulas["latest_de"] = f"D/E = Total Borrowings / Shareholders' Equity\n= ({_cr(lv(borrowings))} / {_cr(eq_v)}) = {latest_de_v}"
+
+    # Interest Coverage
+    if latest_int_cov is not None and op_val is not None and int_cov_raw is not None and int_cov_raw > 0:
+        formulas["interest_coverage"] = f"Interest Coverage = Operating Profit / Interest Expense\n= ({_cr(op_val)} / {_cr(int_cov_raw)}) = {latest_int_cov}x"
+
+    # EPS
+    if latest_eps_v is not None and lv(profit) and sh_norm_f:
+        formulas["latest_eps"] = f"EPS = Net Profit / (Shares / 10⁷)\n= ({_cr(lv(profit))} / ({sh_norm_f/1e7:.1f}Cr / 10⁷)) = ₹{latest_eps_v}"
+
+    # BVPS
+    if latest_bvps_v is not None and eq_v > 0 and sh_norm_f:
+        formulas["latest_bvps"] = f"BVPS = Shareholders' Equity / (Shares / 10⁷)\n= ({_cr(eq_v)} / ({sh_norm_f/1e7:.1f}Cr / 10⁷)) = ₹{latest_bvps_v}"
+
     # ── Build all sections (will add advanced sections after building the base) ──
     result = {
         "company_name": company_name,
@@ -1861,12 +2004,12 @@ def analyze_full(company_name, slug, sheets, biz_info):
         },
 
         "series": {
-            "sales":      series_list(sales),
-            "profit":     series_list(profit),
-            "ebitda":     series_list(ebitda),
-            "borrowings": series_list(borrowings),
-            "reserves":   series_list(reserves),
-            "cfo":        series_list(cfo),
+            "sales":      series_list(q_sales if q_sales else sales, 12),
+            "profit":     series_list(q_profit if q_profit else profit, 12),
+            "ebitda":     series_list(q_ebitda if q_ebitda else ebitda, 12),
+            "borrowings": series_list(q_borrowings if q_borrowings else borrowings, 12),
+            "reserves":   series_list(q_reserves if q_reserves else reserves, 12),
+            "cfo":        series_list(q_cfo if q_cfo else cfo, 12),
         },
 
         "ratios": {
@@ -1911,6 +2054,7 @@ def analyze_full(company_name, slug, sheets, biz_info):
 
         "risks": risks,
         "val": val,
+        "formulas": formulas,
         "scores": scores,
         "overall": overall,
         "verdict": verdict,
@@ -2034,7 +2178,7 @@ def analyze_route():
             r        = req.get(page_url, headers=HEADERS, cookies=COOKIES, timeout=15)
             match    = re.search(r'(?:href|formaction)="(/user/company/export/\d+/)"', r.text)
         if not match:
-            resp = jsonify({"error": "Export URL not found. Check session ID."})
+            resp = jsonify({"error": "Couldn't fetch data. The Screener.in session may have expired. Try uploading an Excel file instead."})
             resp.headers["Cache-Control"] = "no-store"
             return resp, 400
 
@@ -2044,7 +2188,7 @@ def analyze_route():
         r2.raise_for_status()
         csrf_match = re.search(r'csrfmiddlewaretoken[^>]+value="([^"]+)"', r2.text)
         if not csrf_match:
-            resp = jsonify({"error": "CSRF token not found. Session may be expired."})
+            resp = jsonify({"error": "Couldn't fetch data. The Screener.in session may have expired. Try uploading an Excel file instead."})
             resp.headers["Cache-Control"] = "no-store"
             return resp, 401
         csrf_token = csrf_match.group(1)
@@ -2055,7 +2199,7 @@ def analyze_route():
                       data={"csrfmiddlewaretoken": csrf_token, "next": page_url}, timeout=30)
         r3.raise_for_status()
         if b"login" in r3.content[:500].lower() or len(r3.content) < 1000:
-            resp = jsonify({"error": "Session expired. Update SESSION_ID in app.py"})
+            resp = jsonify({"error": "Screener.in session expired. Ask the developer to update the session ID, or upload an Excel file directly."})
             resp.headers["Cache-Control"] = "no-store"
             return resp, 401
 
@@ -2078,25 +2222,25 @@ def analyze_excel():
     """Analyze from uploaded Screener.in Excel file."""
     try:
         if 'file' not in request.files:
-            return jsonify({"error": "No file uploaded"}), 400
+            return jsonify({"error": "No file selected. Please choose an Excel file from your computer."}), 400
 
         file = request.files['file']
         if not file.filename:
-            return jsonify({"error": "Empty file"}), 400
+            return jsonify({"error": "The selected file appears to be empty. Please try a different file."}), 400
 
         if not file.filename.endswith(('.xlsx', '.xls')):
-            return jsonify({"error": "Please upload an Excel file (.xlsx or .xls)"}), 400
+            return jsonify({"error": "Please upload an Excel file (.xlsx or .xls) exported from Screener.in."}), 400
 
         # Read Excel file
         excel_bytes = file.read()
         if len(excel_bytes) < 1000:
-            return jsonify({"error": "Invalid or empty Excel file"}), 400
+            return jsonify({"error": "The file seems too small or empty. Please check the file and try again."}), 400
 
         # Parse Excel
         sheets = parse_excel(BytesIO(excel_bytes))
 
         if not sheets:
-            return jsonify({"error": "Could not parse Excel file. Make sure it's a valid Screener.in export."}), 400
+            return jsonify({"error": "Couldn't read this Excel file. Make sure you're uploading a Screener.in data sheet export (not a custom spreadsheet)."}), 400
 
         # Try to extract company info
         meta = sheets.get("Meta", {}).get("data", {}).get("Meta", {})

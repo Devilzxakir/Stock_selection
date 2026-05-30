@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>StockSense — Smart Stock Analyzer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📈</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
 <style>
@@ -21,6 +22,22 @@
     --muted:    #64748b;
     --card:     #0f1629;
     --glow:     rgba(79,142,247,0.15);
+  }
+
+  [data-theme="light"] {
+    --bg:       #f8fafc;
+    --bg2:      #f1f5f9;
+    --bg3:      #e2e8f0;
+    --border:   #cbd5e1;
+    --acc:      #2563eb;
+    --acc2:     #7c3aed;
+    --green:    #16a34a;
+    --red:      #dc2626;
+    --amber:    #d97706;
+    --text:     #1e293b;
+    --muted:    #94a3b8;
+    --card:     #ffffff;
+    --glow:     rgba(37,99,235,0.12);
   }
 
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -50,6 +67,16 @@
     text-align: center;
     padding: 80px 24px 48px;
   }
+
+  .theme-btn {
+    position: absolute; top: 24px; right: 24px;
+    background: var(--bg3); border: 1px solid var(--border);
+    border-radius: 50%; width: 42px; height: 42px;
+    font-size: 18px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: all .2s; z-index: 10;
+  }
+  .theme-btn:hover { border-color: var(--acc); background: rgba(79,142,247,0.1); }
 
   .logo-badge {
     display: inline-flex; align-items: center; gap: 8px;
@@ -93,7 +120,7 @@
 
   /* ── SEARCH ── */
   .search-wrap {
-    position: relative; z-index: 1;
+    position: relative; z-index: 100;
     max-width: 680px;
     margin: 0 auto;
     padding: 0 24px;
@@ -188,6 +215,18 @@
 
   .loader-text { color: var(--muted); font-size: 14px; font-family: 'DM Mono', monospace; }
 
+  /* ── SKELETON LOADING ── */
+  #skeleton { display: none; max-width: 1100px; margin: 0 auto; padding: 40px 24px 80px; position: relative; z-index: 1; }
+  .sk-shimmer { background: linear-gradient(90deg, var(--bg3) 25%, var(--bg2) 50%, var(--bg3) 75%); background-size: 200% 100%; animation: shimmer 1.5s infinite; border-radius: 8px; }
+  @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+  .sk-verdict { height: 70px; border-radius: 16px; margin-bottom: 24px; }
+  .sk-section { margin-bottom: 24px; }
+  .sk-label { height: 18px; width: 200px; margin-bottom: 12px; }
+  .sk-grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+  .sk-card { height: 160px; border-radius: 16px; }
+  .sk-grid2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+  .sk-table { height: 200px; border-radius: 16px; }
+
   /* ── RESULTS ── */
   #results {
     display: none;
@@ -227,6 +266,35 @@
   }
 
   .btn-pdf:hover { border-color: var(--acc); color: var(--acc); background: rgba(79,142,247,0.06); }
+
+  .btn-share {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 10px;
+    padding: 10px 20px;
+    font-family: 'Syne', sans-serif;
+    font-weight: 600;
+    font-size: 13px;
+    cursor: pointer;
+    transition: all .2s;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .btn-share:hover { border-color: var(--green); color: var(--green); background: rgba(34,197,94,0.06); }
+
+  .sector-badge {
+    display: inline-block;
+    font-size: 12px;
+    font-weight: 600;
+    font-family: 'DM Mono', monospace;
+    background: rgba(79,142,247,0.12);
+    color: var(--acc);
+    padding: 3px 10px;
+    border-radius: 20px;
+    margin-left: 10px;
+    vertical-align: middle;
+    letter-spacing: .03em;
+  }
 
   /* ── VERDICT BANNER ── */
   .verdict-banner {
@@ -369,8 +437,10 @@
     text-align: right;
   }
 
-  .chart-table th:first-child, .chart-table td:first-child { text-align: left; }
-  .chart-table td:first-child { color: var(--acc); font-weight: 600; font-size: 12px; font-family: 'DM Mono', monospace; }
+  .chart-table th:first-child, .chart-table td:first-child { text-align: left; position: sticky; left: 0; z-index: 1; }
+  .chart-table th:first-child { background: var(--card); }
+  .chart-table td:first-child { color: var(--acc); font-weight: 600; font-size: 12px; font-family: 'DM Mono', monospace; background: var(--bg2); }
+  .chart-table th:first-child, .chart-table td:first-child { border-right: 1px solid var(--border); }
   .chart-table tbody tr:last-child td { border-bottom: none; }
 
   /* ── SCORE BAR ── */
@@ -528,12 +598,71 @@
     #results [style*="display: flex"][style*="gap: 24px"] { flex-direction: column; gap: 12px !important; }
     .loan-table-wrap { overflow-x: auto; }
   }
+
+  /* ── FORMULA POPUP ── */
+  .formula-overlay {
+    position: fixed; inset: 0; z-index: 9999;
+    background: rgba(0,0,0,0.6);
+    display: none; align-items: center; justify-content: center;
+    backdrop-filter: blur(4px);
+  }
+  .formula-overlay.active { display: flex; }
+  .formula-popup {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 16px; padding: 28px 32px; max-width: 520px; width: 90%;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    animation: popIn .2s ease;
+  }
+  @keyframes popIn {
+    from { transform: scale(0.92); opacity: 0; }
+    to   { transform: scale(1);    opacity: 1; }
+  }
+  .formula-popup-header {
+    display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px;
+  }
+  .formula-popup-title {
+    font-family: 'Syne', sans-serif; font-weight: 700; font-size: 16px; color: var(--acc);
+  }
+  .formula-popup-close {
+    background: none; border: none; color: var(--muted); font-size: 22px; cursor: pointer; padding: 0 4px; line-height: 1;
+    transition: color .2s;
+  }
+  .formula-popup-close:hover { color: var(--text); }
+  .formula-popup-body {
+    font-family: 'DM Mono', monospace; font-size: 13px; line-height: 1.8;
+    color: var(--text); white-space: pre-wrap; word-break: break-word;
+  }
+  .formula-popup-hint {
+    font-size: 11px; color: var(--muted); margin-top: 12px; padding-top: 10px;
+    border-top: 1px solid var(--border); font-family: 'DM Sans', sans-serif;
+  }
+  .metric-value.has-formula {
+    cursor: pointer; position: relative;
+  }
+  .metric-value.has-formula::after {
+    content: '∑'; position: absolute; top: -2px; right: -8px;
+    font-size: 9px; color: var(--acc); opacity: 0.5;
+  }
+  .metric-value.has-formula:hover::after { opacity: 1; }
+  .checklist-item:hover { filter: brightness(1.3); transform: translateX(2px); }
+  .checklist-item:active { transform: scale(0.99); }
 </style>
 </head>
 <body>
+<div id="formulaOverlay" class="formula-overlay" onclick="hideFormula()">
+  <div class="formula-popup" onclick="event.stopPropagation()">
+    <div class="formula-popup-header">
+      <div class="formula-popup-title" id="formulaTitle"></div>
+      <button class="formula-popup-close" onclick="hideFormula()">✕</button>
+    </div>
+    <div class="formula-popup-body" id="formulaBody"></div>
+    <div class="formula-popup-hint">Double-click any calculated metric to see its formula</div>
+  </div>
+</div>
 
 <!-- HERO -->
 <div class="hero">
+  <button id="themeToggle" class="theme-btn" onclick="toggleTheme()" title="Toggle theme">🌙</button>
   <div class="logo-badge"><span class="logo-dot"></span>Powered by Screener.in Data</div>
   <h1>StockSense</h1>
   <p class="subtitle">Deep fundamental analysis with 5-model valuation.<br>Undervalued or overvalued — know before you invest.</p>
@@ -580,6 +709,38 @@
   <div class="loader-text">Fetching data from Screener.in...</div>
 </div>
 
+<!-- SKELETON LOADING -->
+<div id="skeleton">
+  <div class="sk-shimmer sk-verdict"></div>
+  <div class="sk-section">
+    <div class="sk-shimmer sk-label"></div>
+    <div class="sk-grid3">
+      <div class="sk-shimmer sk-card"></div>
+      <div class="sk-shimmer sk-card"></div>
+      <div class="sk-shimmer sk-card"></div>
+    </div>
+  </div>
+  <div class="sk-section">
+    <div class="sk-shimmer sk-label"></div>
+    <div class="sk-grid3">
+      <div class="sk-shimmer sk-card"></div>
+      <div class="sk-shimmer sk-card"></div>
+      <div class="sk-shimmer sk-card"></div>
+    </div>
+  </div>
+  <div class="sk-section">
+    <div class="sk-shimmer sk-label"></div>
+    <div class="sk-shimmer sk-table"></div>
+  </div>
+  <div class="sk-section">
+    <div class="sk-shimmer sk-label"></div>
+    <div class="sk-grid2">
+      <div class="sk-shimmer sk-card"></div>
+      <div class="sk-shimmer sk-card"></div>
+    </div>
+  </div>
+</div>
+
 <!-- ERROR -->
 <div id="errorBox" class="error-box" style="display:none"></div>
 
@@ -594,6 +755,7 @@ let searchTimer  = null;
 const input    = document.getElementById('searchInput');
 const dropdown = document.getElementById('dropdown');
 const loader   = document.getElementById('loader');
+const skeleton = document.getElementById('skeleton');
 const results  = document.getElementById('results');
 const errorBox = document.getElementById('errorBox');
 const searchBtn= document.getElementById('searchBtn');
@@ -618,7 +780,8 @@ excelUpload.addEventListener('change', async (e) => {
   }
 
   try {
-    loader.style.display = 'block';
+    loader.style.display = 'none';
+    skeleton.style.display = 'block';
     results.style.display = 'none';
     errorBox.style.display = 'none';
 
@@ -630,7 +793,7 @@ excelUpload.addEventListener('change', async (e) => {
     const data = await res.json();
     if (data.error) throw new Error(data.error);
 
-    loader.style.display = 'none';
+    skeleton.style.display = 'none';
     results.style.display = 'block';
 
     // Use filename as company name if not in data
@@ -663,11 +826,15 @@ excelUpload.addEventListener('change', async (e) => {
 // ── SEARCH DEBOUNCE ──
 input.addEventListener('input', () => {
   clearTimeout(searchTimer);
-  selectedSlug = null;  // clear previous selection when typing
+  selectedSlug = null;
   selectedName = null;
   const q = input.value.trim();
-  if (!q) { dropdown.style.display = 'none'; return; }
+  if (!q) { showSearchHistory(); return; }
   searchTimer = setTimeout(() => fetchSuggestions(q), 300);
+});
+
+input.addEventListener('focus', () => {
+  if (!input.value.trim()) showSearchHistory();
 });
 
 async function fetchSuggestions(q) {
@@ -718,9 +885,29 @@ document.addEventListener('click', e => {
 let liveTimer = null;
 
 // ── RUN ANALYSIS ──
+// ── SEARCH HISTORY (last 5) ──
+function saveSearch(name, slug) {
+  let h = JSON.parse(localStorage.getItem('ss_history') || '[]');
+  h = h.filter(s => s.slug !== slug);
+  h.unshift({ name, slug, time: Date.now() });
+  if (h.length > 5) h = h.slice(0, 5);
+  localStorage.setItem('ss_history', JSON.stringify(h));
+}
+
+function showSearchHistory() {
+  const dd = document.getElementById('dropdown');
+  const h = JSON.parse(localStorage.getItem('ss_history') || '[]');
+  if (!h.length) { dd.style.display = 'none'; return; }
+  dd.innerHTML = `<div style="padding:6px 14px 2px;font-size:10px;color:var(--muted);letter-spacing:.1em;text-transform:uppercase;border-bottom:1px solid var(--border)">Recent</div>` +
+    h.map(s => `<div class="drop-item" data-slug="${s.slug}" data-name="${s.name}"><span class="drop-icon">🕐</span><span class="drop-name">${s.name}</span></div>`).join('');
+  dd.style.display = 'block';
+}
+
 async function runAnalysis() {
   if (!selectedSlug) return;
-  loader.style.display   = 'block';
+  saveSearch(selectedName, selectedSlug);
+  loader.style.display   = 'none';
+  skeleton.style.display = 'block';
   results.style.display  = 'none';
   errorBox.style.display = 'none';
   dropdown.style.display = 'none';
@@ -730,14 +917,14 @@ async function runAnalysis() {
     const res  = await fetch(`/api/analyze?slug=${encodeURIComponent(selectedSlug)}&name=${encodeURIComponent(selectedName)}&_=${Date.now()}`);
     const data = await res.json();
     if (data.error) throw new Error(data.error);
-    loader.style.display  = 'none';
+    skeleton.style.display = 'none';
     results.style.display = 'block';
     renderResults(data);
     // Start live price polling
     fetchLivePrice();
     liveTimer = setInterval(fetchLivePrice, 30000);
   } catch(err) {
-    loader.style.display   = 'none';
+    skeleton.style.display  = 'none';
     errorBox.style.display = 'block';
     errorBox.textContent   = '❌  ' + err.message;
   }
@@ -792,11 +979,11 @@ function scoreClass(s) {
 }
 
 function renderSeries(series, label) {
-  if (!series || !series.length) return '<tr><td>' + label + '</td><td colspan="10" style="color:var(--muted)">N/A</td></tr>';
-  const last8 = series.slice(-8);
+  if (!series || !series.length) return '<tr><td>' + label + '</td><td colspan="12" style="color:var(--muted)">N/A</td></tr>';
+  const lastN = series.slice(-12);
   return `<tr>
     <td>${label}</td>
-    ${last8.map(d => `<td>${d.value !== null ? Math.round(d.value).toLocaleString() : '—'}</td>`).join('')}
+    ${lastN.map(d => `<td>${d.value !== null ? Math.round(d.value).toLocaleString() : '—'}</td>`).join('')}
   </tr>`;
 }
 
@@ -811,8 +998,11 @@ function renderResults(A) {
   const gr  = A.growth || {};
   const lt  = A.long_term || {};
   const chk = A.checklist || {};
+  const fm  = A.formulas || {};
+  formulaData = fm;
+  checklistData = (A.twenty_point_checklist && A.twenty_point_checklist.checklist) || [];
 
-  const years = (s.sales || s.profit || s.ebitda || []).slice(-8).map(d => `<th>${d.year.replace('Mar ','')}</th>`).join('');
+  const years = (s.sales || s.profit || s.ebitda || []).slice(-12).map(d => `<th>${d.year}</th>`).join('');
   const upColor = val ? (val.upside_pct >= 10 ? 'green' : val.upside_pct >= -10 ? 'amber' : 'red') : 'neutral';
 
   function valColor(v, goodHigh=true) {
@@ -823,10 +1013,13 @@ function renderResults(A) {
   results.innerHTML = `
     <div class="results-header fade-in">
       <div>
-        <div class="company-title">${A.company_name}</div>
+        <div class="company-title">${A.company_name} ${b.industry && b.industry !== 'N/A' ? `<span class="sector-badge">${b.industry}</span>` : ''}</div>
         <div class="gen-time">Generated ${A.generated_at}</div>
       </div>
-      <button class="btn-pdf" onclick="downloadPDF()">⬇️ Download PDF Report</button>
+      <div style="display:flex;gap:8px">
+        <button class="btn-share" onclick="shareAnalysis('${A.company_name}')">🔗 Share</button>
+        <button class="btn-pdf" onclick="downloadPDF()">⬇️ PDF</button>
+      </div>
     </div>
 
     <!-- VERDICT -->
@@ -885,15 +1078,15 @@ function renderResults(A) {
         <div class="metric-grid">
           <div class="metric-item">
             <div class="metric-label">Revenue CAGR</div>
-            <div class="metric-value ${numColor(m.rev_cagr, '>', 10)}">${fmt(m.rev_cagr, '%')}</div>
+            <div class="metric-value ${numColor(m.rev_cagr, '>', 10)}${fm.rev_cagr ? ' has-formula' : ''}"${fm.rev_cagr ? ` data-key="rev_cagr"` : ''}>${fmt(m.rev_cagr, '%')}</div>
           </div>
           <div class="metric-item">
             <div class="metric-label">Profit CAGR</div>
-            <div class="metric-value ${numColor(m.pro_cagr, '>', 10)}">${fmt(m.pro_cagr, '%')}</div>
+            <div class="metric-value ${numColor(m.pro_cagr, '>', 10)}${fm.pro_cagr ? ' has-formula' : ''}"${fm.pro_cagr ? ` data-key="pro_cagr"` : ''}>${fmt(m.pro_cagr, '%')}</div>
           </div>
           <div class="metric-item">
             <div class="metric-label">EPS CAGR</div>
-            <div class="metric-value ${numColor(gr.eps_cagr, '>', 10)}">${fmt(gr.eps_cagr, '%')}</div>
+            <div class="metric-value ${numColor(gr.eps_cagr, '>', 10)}${fm.eps_cagr ? ' has-formula' : ''}"${fm.eps_cagr ? ` data-key="eps_cagr"` : ''}>${fmt(gr.eps_cagr, '%')}</div>
           </div>
         </div>
       </div>
@@ -902,19 +1095,19 @@ function renderResults(A) {
         <div class="metric-grid">
           <div class="metric-item">
             <div class="metric-label">OPM</div>
-            <div class="metric-value ${numColor(m.latest_opm, '>', 15)}">${fmt(m.latest_opm, '%')}</div>
+            <div class="metric-value ${numColor(m.latest_opm, '>', 15)}${fm.latest_opm ? ' has-formula' : ''}"${fm.latest_opm ? ` data-key="latest_opm"` : ''}>${fmt(m.latest_opm, '%')}</div>
           </div>
           <div class="metric-item">
             <div class="metric-label">Net Margin</div>
-            <div class="metric-value ${numColor(m.net_margin, '>', 10)}">${fmt(m.net_margin, '%')}</div>
+            <div class="metric-value ${numColor(m.net_margin, '>', 10)}${fm.net_margin ? ' has-formula' : ''}"${fm.net_margin ? ` data-key="net_margin"` : ''}>${fmt(m.net_margin, '%')}</div>
           </div>
           <div class="metric-item">
             <div class="metric-label">ROE</div>
-            <div class="metric-value ${numColor(m.latest_roe, '>', 15)}">${fmt(m.latest_roe, '%')}</div>
+            <div class="metric-value ${numColor(m.latest_roe, '>', 15)}${fm.latest_roe ? ' has-formula' : ''}"${fm.latest_roe ? ` data-key="latest_roe"` : ''}>${fmt(m.latest_roe, '%')}</div>
           </div>
           <div class="metric-item">
             <div class="metric-label">ROCE</div>
-            <div class="metric-value ${numColor(m.latest_roce, '>', 15)}">${fmt(m.latest_roce, '%')}</div>
+            <div class="metric-value ${numColor(m.latest_roce, '>', 15)}${fm.latest_roce ? ' has-formula' : ''}"${fm.latest_roce ? ` data-key="latest_roce"` : ''}>${fmt(m.latest_roce, '%')}</div>
           </div>
         </div>
       </div>
@@ -927,15 +1120,15 @@ function renderResults(A) {
           </div>
           <div class="metric-item">
             <div class="metric-label">P/E</div>
-            <div class="metric-value">${fmt(m.latest_pe, 'x')}</div>
+            <div class="metric-value${fm.latest_pe ? ' has-formula' : ''}"${fm.latest_pe ? ` data-key="latest_pe"` : ''}>${fmt(m.latest_pe, 'x')}</div>
           </div>
           <div class="metric-item">
             <div class="metric-label">D/E Ratio</div>
-            <div class="metric-value ${numColor(m.latest_de, '<', 0.5)}">${fmt(m.latest_de, 'x', 2)}</div>
+            <div class="metric-value ${numColor(m.latest_de, '<', 0.5)}${fm.latest_de ? ' has-formula' : ''}"${fm.latest_de ? ` data-key="latest_de"` : ''}>${fmt(m.latest_de, 'x', 2)}</div>
           </div>
           <div class="metric-item">
             <div class="metric-label">Interest Coverage</div>
-            <div class="metric-value ${numColor(m.interest_coverage, '>', 3)}">${fmt(m.interest_coverage, 'x')}</div>
+            <div class="metric-value ${numColor(m.interest_coverage, '>', 3)}${fm.interest_coverage ? ' has-formula' : ''}"${fm.interest_coverage ? ` data-key="interest_coverage"` : ''}>${fmt(m.interest_coverage, 'x')}</div>
           </div>
           <div class="metric-item">
             <div class="metric-label">Debt Trend</div>
@@ -981,9 +1174,9 @@ function renderResults(A) {
     </div>
 
     <!-- TRENDS TABLE -->
-    <div class="section-label fade-in">📈 Historical Trends</div>
+    <div class="section-label fade-in">📈 Quarterly Trends</div>
     <div class="card fade-in">
-      <div class="card-title">Financial Data (₹ Crores)</div>
+      <div class="card-title">Quarterly Financial Data (₹ Crores)</div>
       <div style="overflow-x:auto">
         <table class="chart-table">
           <thead><tr><th style="text-align:left">Metric</th>${years}</tr></thead>
@@ -1055,18 +1248,7 @@ function renderResults(A) {
       <div class="card">
         <div class="card-title">📈 Growth Analysis</div>
         <div class="metric-grid">
-          <div class="metric-item">
-            <div class="metric-label">Revenue CAGR</div>
-            <div class="metric-value ${numColor(gr.rev_cagr, '>', 10)}">${fmt(gr.rev_cagr, '%')}</div>
-          </div>
-          <div class="metric-item">
-            <div class="metric-label">Profit CAGR</div>
-            <div class="metric-value ${numColor(gr.pro_cagr, '>', 10)}">${fmt(gr.pro_cagr, '%')}</div>
-          </div>
-          <div class="metric-item">
-            <div class="metric-label">EPS CAGR</div>
-            <div class="metric-value ${numColor(gr.eps_cagr, '>', 10)}">${fmt(gr.eps_cagr, '%')}</div>
-          </div>
+
           <div class="metric-item">
             <div class="metric-label">Consistent Growth</div>
             <div class="metric-value ${gr.consistent_growth === 'Yes' ? 'green' : 'amber'}">${gr.consistent_growth || 'N/A'}</div>
@@ -1251,21 +1433,8 @@ function renderResults(A) {
       </div>
     </div>
 
-    <!-- INTEREST COVERAGE + MAGIC FORMULA + PROMOTER TREND -->
-    <div class="grid-3 fade-in">
-      <div class="card">
-        <div class="card-title">💰 Interest Coverage Analysis</div>
-        ${A.interest_coverage_analysis ? `
-        <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:8px">
-          <span style="font-family:'Syne',sans-serif;font-size:28px;font-weight:800;color:${A.interest_coverage_analysis.status === 'Safe' ? 'var(--green)' : A.interest_coverage_analysis.status === 'Moderate' ? 'var(--amber)' : 'var(--red)'}">${A.interest_coverage_analysis.latest ? A.interest_coverage_analysis.latest.toFixed(1) + 'x' : 'N/A'}</span>
-        </div>
-        <div style="font-size:13px;font-weight:600;color:${A.interest_coverage_analysis.status === 'Safe' ? 'var(--green)' : A.interest_coverage_analysis.status === 'Moderate' ? 'var(--amber)' : 'var(--red)'}">${A.interest_coverage_analysis.status}</div>
-        ${A.interest_coverage_analysis.trend && A.interest_coverage_analysis.trend.length > 1 ? `
-        <div style="display:flex;gap:4px;margin-top:8px;flex-wrap:wrap">
-          ${A.interest_coverage_analysis.trend.slice(-5).map(v => `<div style="background:var(--bg3);border-radius:4px;padding:3px 6px;font-size:10px;font-family:'DM Mono',monospace;color:${v && v > 3 ? 'var(--green)' : v && v > 1.5 ? 'var(--amber)' : 'var(--red)'}">${v ? v.toFixed(1) + 'x' : '—'}</div>`).join('')}
-        </div>` : ''}
-        ` : '<div style="color:var(--muted);font-size:12px">Insufficient data</div>'}
-      </div>
+    <!-- MAGIC FORMULA + PROMOTER TREND -->
+    <div class="grid-2 fade-in">
       <div class="card">
         <div class="card-title">⚡ Magic Formula (Greenblatt)</div>
         ${A.magic_formula ? `
@@ -1435,10 +1604,10 @@ function renderResults(A) {
       </div>
       <div style="font-size:12px;color:var(--muted);text-align:center;margin-bottom:20px">${A.twenty_point_checklist.action}</div>
       <div style="display:grid;grid-template-columns:1fr;gap:6px">
-        ${A.twenty_point_checklist.checklist.map(item => {
+        ${A.twenty_point_checklist.checklist.map((item, idx) => {
           const wMap = {high: '🔴 High', medium: '🟡 Medium', low: '⚪ Low'};
           return `
-          <div style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:8px;background:${item.pass ? 'rgba(34,197,94,0.04)' : 'rgba(239,68,68,0.04)'};border:1px solid ${item.pass ? 'rgba(34,197,94,0.1)' : 'rgba(239,68,68,0.1)'}">
+          <div class="checklist-item" data-checklist-index="${idx}" style="display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:8px;background:${item.pass ? 'rgba(34,197,94,0.04)' : 'rgba(239,68,68,0.04)'};border:1px solid ${item.pass ? 'rgba(34,197,94,0.1)' : 'rgba(239,68,68,0.1)'};cursor:pointer;transition:all .15s">
             <div style="font-size:16px;flex-shrink:0">${item.pass ? '✅' : '❌'}</div>
             <div style="flex:1;min-width:0">
               <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">
@@ -1545,6 +1714,122 @@ function renderResults(A) {
 function downloadPDF() {
   if (!selectedSlug) return;
   window.location.href = `/api/pdf?slug=${encodeURIComponent(selectedSlug)}&name=${encodeURIComponent(selectedName)}`;
+}
+
+// ── Popup data ──
+let formulaData = {};
+let checklistData = [];
+
+// formulaData & checklistData are populated inside renderResults() above
+
+function showFormula(key) {
+  const f = formulaData[key];
+  if (!f) return;
+  const title = key.replace('latest_','').replace(/_/g,' ').toUpperCase().replace(/CAGR/g,'CAGR');
+  document.getElementById('formulaTitle').textContent = title;
+  document.getElementById('formulaBody').innerHTML = `<div style="font-family:'DM Mono',monospace;font-size:13px;line-height:1.8;white-space:pre-wrap">${escHtml(f)}</div>`;
+  document.getElementById('formulaOverlay').classList.add('active');
+}
+
+function showChecklistDetail(idx) {
+  const item = checklistData[idx];
+  if (!item) return;
+  const wMap = {high: '🔴 High', medium: '🟡 Medium', low: '⚪ Low'};
+  const passStr = item.pass
+    ? '<span style="color:var(--green);font-weight:700">✅ PASS</span>'
+    : '<span style="color:var(--red);font-weight:700">❌ FAIL</span>';
+  document.getElementById('formulaTitle').textContent = `#${item.point} — ${item.category}`;
+  document.getElementById('formulaBody').innerHTML = `
+    <div style="display:flex;flex-direction:column;gap:16px">
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Question</div>
+        <div style="font-size:14px;color:var(--text);font-weight:600">${escHtml(item.question)}</div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Verdict</div>
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+          ${passStr}
+          <span style="font-size:11px;color:var(--muted)">${wMap[item.weight] || item.weight} importance</span>
+        </div>
+      </div>
+      <div>
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px">Data Checked</div>
+        <div style="font-size:13px;color:${item.pass ? 'var(--green)' : 'var(--red)'};line-height:1.5">${escHtml(item.detail)}</div>
+      </div>
+      ${item.reason ? `
+      <div style="background:var(--bg3);border-radius:10px;padding:14px 16px;border:1px solid var(--border)">
+        <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Why?</div>
+        <div style="font-size:12px;color:var(--text);line-height:1.7">${escHtml(item.reason)}</div>
+      </div>` : ''}
+    </div>`;
+  document.getElementById('formulaOverlay').classList.add('active');
+}
+
+function hideFormula() {
+  document.getElementById('formulaOverlay').classList.remove('active');
+}
+
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+document.addEventListener('dblclick', function(e) {
+  const el = e.target.closest('[data-key]');
+  if (el) {
+    const key = el.getAttribute('data-key');
+    showFormula(key);
+  }
+});
+
+document.addEventListener('click', function(e) {
+  const el = e.target.closest('[data-checklist-index]');
+  if (el) {
+    const idx = parseInt(el.getAttribute('data-checklist-index'), 10);
+    showChecklistDetail(idx);
+  }
+});
+
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') hideFormula();
+});
+
+function toggleTheme() {
+  const html = document.documentElement;
+  const btn = document.getElementById('themeToggle');
+  if (html.getAttribute('data-theme') === 'light') {
+    html.removeAttribute('data-theme');
+    btn.textContent = '🌙';
+    localStorage.setItem('ss_theme', 'dark');
+  } else {
+    html.setAttribute('data-theme', 'light');
+    btn.textContent = '☀️';
+    localStorage.setItem('ss_theme', 'light');
+  }
+}
+
+// Restore saved theme on load
+(function() {
+  const saved = localStorage.getItem('ss_theme');
+  if (saved === 'light') {
+    document.documentElement.setAttribute('data-theme', 'light');
+    document.getElementById('themeToggle').textContent = '☀️';
+  }
+})();
+
+function shareAnalysis(name) {
+  const url = window.location.href.split('?')[0] + '?slug=' + encodeURIComponent(selectedSlug);
+  navigator.clipboard.writeText(url).then(() => {
+    const btn = document.querySelector('.btn-share');
+    const orig = btn.innerHTML;
+    btn.innerHTML = '✅ Copied!';
+    btn.style.borderColor = 'var(--green)';
+    btn.style.color = 'var(--green)';
+    setTimeout(() => { btn.innerHTML = orig; btn.style.borderColor = ''; btn.style.color = ''; }, 2500);
+  }).catch(() => {
+    prompt('Copy this link:', url);
+  });
 }
 </script>
 </body>
