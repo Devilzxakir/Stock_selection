@@ -4,3 +4,4 @@ __pycache__
 .gitignore
 stderr.txt
 stdout.txt
+users.json

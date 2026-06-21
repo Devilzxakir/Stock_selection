@@ -4,11 +4,13 @@ Run: python app.py
 Visit: http://localhost:5000
 """
 
-from flask import Flask, request, jsonify, render_template, send_file
+from flask import Flask, request, jsonify, render_template, send_file, session, redirect, url_for
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
 import requests as req
 import pandas as pd
-import math, re, os, io
-from datetime import datetime
+import math, re, os, io, json
+from datetime import datetime, timedelta
 from io import BytesIO
 
 # PDF
@@ -22,6 +24,30 @@ from reportlab.platypus import (
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 
 app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "stocksense-dev-key-change-in-prod")
+app.permanent_session_lifetime = timedelta(days=7)
+USERS_FILE = "users.json"
+
+# ── AUTH HELPERS ──────────────────────────────────────────────────────────────
+def load_users():
+    env_json = os.environ.get("USERS_JSON")
+    if env_json:
+        try: return json.loads(env_json)
+        except: pass
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, "r") as f: return json.load(f)
+    return {}
+
+def save_users(users):
+    with open(USERS_FILE, "w") as f: json.dump(users, f, indent=2)
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if "user" not in session:
+            return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return decorated
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 SESSION_ID = os.environ.get("SESSION_ID", "wd45cahfg2g5q6tqyabmkfw7zjih1bbb")
@@ -2153,15 +2179,61 @@ def analyze_full(company_name, slug, sheets, biz_info):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# AUTH ROUTES
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/landing")
+def landing():
+    return render_template("landing.html")
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if request.method == "POST":
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        users = load_users()
+        if email in users and check_password_hash(users[email]["password"], password):
+            session.permanent = True
+            session["user"] = {"email": email, "name": users[email]["name"]}
+            return jsonify({"ok": True})
+        return jsonify({"error": "Invalid email or password"}), 401
+    return render_template("login.html")
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
+        if not name or not email or not password:
+            return jsonify({"error": "All fields are required"}), 400
+        if len(password) < 6:
+            return jsonify({"error": "Password must be at least 6 characters"}), 400
+        users = load_users()
+        if email in users:
+            return jsonify({"error": "Email already registered"}), 409
+        users[email] = {"name": name, "password": generate_password_hash(password)}
+        save_users(users)
+        return jsonify({"ok": True})
+    return render_template("register.html")
+
+@app.route("/logout")
+def logout():
+    session.pop("user", None)
+    return redirect(url_for("landing"))
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ROUTES
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/")
+@login_required
 def index():
-    return render_template("index.html")
+    return render_template("index.html", user=session.get("user"))
 
 
 @app.route("/api/search")
+@login_required
 def search():
     q = request.args.get("q", "").strip()
     if not q:
@@ -2176,6 +2248,7 @@ def search():
 
 
 @app.route("/api/analyze")
+@login_required
 def analyze_route():
     slug = request.args.get("slug", "").strip()
     name = request.args.get("name", slug)
@@ -2231,6 +2304,7 @@ def analyze_route():
 
 
 @app.route("/api/analyze/excel", methods=["POST"])
+@login_required
 def analyze_excel():
     """Analyze from uploaded Screener.in Excel file."""
     try:
@@ -2294,6 +2368,7 @@ def analyze_excel():
 
 
 @app.route("/api/pdf")
+@login_required
 def generate_pdf():
     """Quick PDF download — pass same params as /analyze."""
     slug = request.args.get("slug", "").strip()
@@ -2316,6 +2391,7 @@ def generate_pdf():
 
 
 @app.route("/api/live")
+@login_required
 def live_price():
     slug = request.args.get("slug", "").strip()
     name = request.args.get("name", slug)
