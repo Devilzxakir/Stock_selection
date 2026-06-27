@@ -1038,15 +1038,15 @@ let liveTimer = null;
 // ── SEARCH HISTORY (last 5) ──
 function saveSearch(name, slug) {
   let h = JSON.parse(localStorage.getItem('ss_history') || '[]');
-  h = h.filter(s => s.slug !== slug);
-  h.unshift({ name, slug, time: Date.now() });
+  h = h.filter(s => s.slug !== slug || s.market !== currentMarket);
+  h.unshift({ name, slug, market: currentMarket, time: Date.now() });
   if (h.length > 5) h = h.slice(0, 5);
   localStorage.setItem('ss_history', JSON.stringify(h));
 }
 
 function showSearchHistory() {
   const dd = document.getElementById('dropdown');
-  const h = JSON.parse(localStorage.getItem('ss_history') || '[]');
+  const h = JSON.parse(localStorage.getItem('ss_history') || '[]').filter(s => s.market === currentMarket);
   if (!h.length) { dd.style.display = 'none'; return; }
   dd.innerHTML = `<div style="padding:6px 14px 2px;font-size:10px;color:var(--muted);letter-spacing:.1em;text-transform:uppercase;border-bottom:1px solid var(--border)">Recent</div>` +
     h.map(s => `<div class="drop-item" data-slug="${escHtml(s.slug)}" data-name="${escHtml(s.name)}"><span class="drop-icon">🕐</span><span class="drop-name">${escHtml(s.name)}</span></div>`).join('');
@@ -1066,10 +1066,14 @@ function switchMarket(market) {
     : '<span class="logo-dot"></span>Powered by Screener.in Data';
   selectedSlug = null;
   selectedTicker = null;
-  document.getElementById('results').style.display = 'none';
-  document.getElementById('sectorResults').style.display = 'none';
-  document.getElementById('dropdown').style.display = 'none';
   input.value = '';
+  document.getElementById('results').style.display = 'none';
+  document.getElementById('results').innerHTML = '';
+  document.getElementById('sectorResults').style.display = 'none';
+  document.getElementById('sectorResults').innerHTML = '';
+  document.getElementById('dropdown').style.display = 'none';
+  document.getElementById('dropdown').innerHTML = '';
+  _curAnalysis = null;
   clearInterval(liveTimer);
   if (isUS) loadSectors();
 }
@@ -1084,7 +1088,7 @@ async function fetchSuggestionsUS(q) {
       <span class="drop-icon">🇺🇸</span>
       <div>
         <div class="drop-name">${escHtml(c.name)} <span style="font-size:10px;color:var(--muted);font-family:'DM Mono',monospace">${escHtml(c.ticker)}</span></div>
-        <div class="drop-url">${escHtml(c.sector)} ${c.price ? '• ' + escHtml(c.price) : ''}</div>
+        <div class="drop-url">${escHtml(c.sector || '')} ${c.exchange ? '• ' + escHtml(c.exchange) : ''} ${c.price ? '• ' + escHtml(c.price) : ''}</div>
       </div>
     </div>`).join('');
   dropdown.style.display = 'block';
@@ -1285,16 +1289,32 @@ function scoreClass(s) {
   return s >= 8 ? 'green' : s >= 6 ? 'amber' : 'red';
 }
 
+let _curAnalysis = null;
+function fmtBig(v) {
+  if (v === null || v === undefined) return 'N/A';
+  const isUS = _curAnalysis && _curAnalysis.market === 'US';
+  if (isUS) {
+    const av = Math.abs(v); const sign = v < 0 ? '-' : '';
+    if (av >= 1e12) return sign + '$' + (av/1e12).toFixed(1) + 'T';
+    if (av >= 1e9)  return sign + '$' + (av/1e9).toFixed(1) + 'B';
+    if (av >= 1e6)  return sign + '$' + (av/1e6).toFixed(1) + 'M';
+    if (av >= 1e3)  return sign + '$' + (av/1e3).toFixed(1) + 'K';
+    return sign + '$' + av.toFixed(1);
+  }
+  return '₹' + Number(v).toLocaleString(undefined, {maximumFractionDigits:1}) + ' Cr';
+}
+
 function renderSeries(series, label) {
   if (!series || !series.length) return '<tr><td>' + label + '</td><td colspan="12" style="color:var(--muted)">N/A</td></tr>';
   const lastN = series.slice(-12);
   return `<tr>
     <td>${label}</td>
-    ${lastN.map(d => `<td>${d.value !== null ? Math.round(d.value).toLocaleString() : '—'}</td>`).join('')}
+    ${lastN.map(d => `<td>${d.value !== null ? fmtBig(d.value) : '—'}</td>`).join('')}
   </tr>`;
 }
 
 function renderResults(A) {
+  _curAnalysis = A;
   const m   = A.metrics;
   const val = A.val;
   const s   = A.series;
@@ -1308,6 +1328,9 @@ function renderResults(A) {
   const fm  = A.formulas || {};
   formulaData = fm;
   checklistData = (A.twenty_point_checklist && A.twenty_point_checklist.checklist) || [];
+
+  const isUS = A.market === 'US';
+  const CUR = isUS ? '$' : '₹';
 
   const years = (s.sales || s.profit || s.ebitda || []).slice(-12).map(d => `<th>${d.year}</th>`).join('');
   const upColor = val ? (val.upside_pct >= 10 ? 'green' : val.upside_pct >= -10 ? 'amber' : 'red') : 'neutral';
@@ -1350,7 +1373,7 @@ function renderResults(A) {
           </div>
           <div class="metric-item">
             <div class="metric-label">Market Cap</div>
-            <div class="metric-value" style="font-size:14px">₹${b.market_cap ? b.market_cap.toLocaleString() : 'N/A'} Cr</div>
+            <div class="metric-value" style="font-size:14px">${fmtBig(b.market_cap)}</div>
           </div>
           <div class="metric-item">
             <div class="metric-label">Category</div>
@@ -1483,7 +1506,7 @@ function renderResults(A) {
     <!-- TRENDS TABLE -->
     <div class="section-label fade-in">📈 Quarterly Trends</div>
     <div class="card fade-in">
-      <div class="card-title">Quarterly Financial Data (₹ Crores)</div>
+      <div class="card-title">Quarterly Financial Data (${isUS ? 'Billions USD' : '₹ Crores'})</div>
       <div style="overflow-x:auto">
         <table class="chart-table">
           <thead><tr><th style="text-align:left">Metric</th>${years}</tr></thead>
@@ -1514,15 +1537,15 @@ function renderResults(A) {
           </div>
           <div class="metric-item">
             <div class="metric-label">Cash Reserves</div>
-            <div class="metric-value" style="font-size:14px">₹${bs.cash_reserves !== null && bs.cash_reserves !== undefined ? bs.cash_reserves.toFixed(1) : 'N/A'} Cr</div>
+            <div class="metric-value" style="font-size:14px">${fmtBig(bs.cash_reserves)}</div>
           </div>
           <div class="metric-item">
             <div class="metric-label">Borrowings</div>
-            <div class="metric-value" style="font-size:14px">₹${bs.borrowings_latest !== null && bs.borrowings_latest !== undefined ? bs.borrowings_latest.toFixed(1) : 'N/A'} Cr</div>
+            <div class="metric-value" style="font-size:14px">${fmtBig(bs.borrowings_latest)}</div>
           </div>
           <div class="metric-item">
             <div class="metric-label">Reserves</div>
-            <div class="metric-value" style="font-size:14px">₹${bs.reserves_latest !== null && bs.reserves_latest !== undefined ? bs.reserves_latest.toFixed(1) : 'N/A'} Cr</div>
+            <div class="metric-value" style="font-size:14px">${fmtBig(bs.reserves_latest)}</div>
           </div>
         </div>
       </div>
@@ -1535,7 +1558,7 @@ function renderResults(A) {
           </div>
           <div class="metric-item">
             <div class="metric-label">Latest CFO</div>
-            <div class="metric-value" style="font-size:14px">₹${cf.cfo_latest !== null && cf.cfo_latest !== undefined ? cf.cfo_latest.toFixed(1) : 'N/A'} Cr</div>
+            <div class="metric-value" style="font-size:14px">${fmtBig(cf.cfo_latest)}</div>
           </div>
           <div class="metric-item">
             <div class="metric-label">Profit vs Cash</div>
@@ -1616,11 +1639,11 @@ function renderResults(A) {
       <div class="val-hero">
         <div class="val-stat">
           <div class="val-stat-label">Current Price</div>
-          <div class="val-stat-value neutral">₹${val.current_price.toLocaleString()}</div>
+          <div class="val-stat-value neutral">${CUR}${val.current_price.toLocaleString()}</div>
         </div>
         <div class="val-stat">
           <div class="val-stat-label">Intrinsic Value</div>
-          <div class="val-stat-value ${upColor}">₹${val.weighted_iv.toLocaleString()}</div>
+          <div class="val-stat-value ${upColor}">${CUR}${val.weighted_iv.toLocaleString()}</div>
         </div>
         <div class="val-stat">
           <div class="val-stat-label">Upside / Downside</div>
@@ -1649,13 +1672,13 @@ function renderResults(A) {
         const key = 'val_' + name.toLowerCase().replace(/\s+/g, '_').replace(/\(/g, '').replace(/\)/g, '').replace(/\//g, '_');
         return `<div class="model-row">
           <div class="model-name">${name}</div>
-          <div class="model-iv ${cls} has-formula" data-key="${key}">₹${iv.toLocaleString()}</div>
+          <div class="model-iv ${cls} has-formula" data-key="${key}">${CUR}${iv.toLocaleString()}</div>
           <div class="model-formula">${md.formula}</div>
         </div>`;
       }).join('')}
       <div class="model-row total-row">
         <div class="model-name" style="color:var(--acc)">WEIGHTED INTRINSIC VALUE</div>
-        <div class="model-iv ${upColor} has-formula" data-key="weighted_iv" style="font-size:18px">₹${val.weighted_iv.toLocaleString()}</div>
+        <div class="model-iv ${upColor} has-formula" data-key="weighted_iv" style="font-size:18px">${CUR}${val.weighted_iv.toLocaleString()}</div>
         <div class="model-formula">Weighted average of all 5 models</div>
       </div>
       <div class="val-verdict-strip ${val.val_class}">${val.val_verdict}</div>
@@ -1792,23 +1815,23 @@ function renderResults(A) {
         <div class="metric-grid" style="grid-template-columns:1fr 1fr">
           <div class="metric-item">
             <div class="metric-label">Strong Buy Below</div>
-            <div class="metric-value" style="font-size:16px;color:var(--green)">₹${A.entry_zones.strong_buy_below.toLocaleString()}</div>
+            <div class="metric-value" style="font-size:16px;color:var(--green)">${CUR}${A.entry_zones.strong_buy_below.toLocaleString()}</div>
           </div>
           <div class="metric-item">
             <div class="metric-label">Buy Below</div>
-            <div class="metric-value" style="font-size:16px;color:var(--green)">₹${A.entry_zones.buy_below.toLocaleString()}</div>
+            <div class="metric-value" style="font-size:16px;color:var(--green)">${CUR}${A.entry_zones.buy_below.toLocaleString()}</div>
           </div>
           <div class="metric-item">
             <div class="metric-label">Fair Value</div>
-            <div class="metric-value" style="font-size:16px;color:var(--text)">₹${A.entry_zones.fair_value.toLocaleString()}</div>
+            <div class="metric-value" style="font-size:16px;color:var(--text)">${CUR}${A.entry_zones.fair_value.toLocaleString()}</div>
           </div>
           <div class="metric-item">
             <div class="metric-label">Overvalued Above</div>
-            <div class="metric-value" style="font-size:16px;color:var(--red)">₹${A.entry_zones.overvalued_above.toLocaleString()}</div>
+            <div class="metric-value" style="font-size:16px;color:var(--red)">${CUR}${A.entry_zones.overvalued_above.toLocaleString()}</div>
           </div>
           <div class="metric-item" style="grid-column:1/-1">
             <div class="metric-label">Current Price</div>
-            <div class="metric-value" style="font-size:22px">₹${A.entry_zones.current_price.toLocaleString()}</div>
+            <div class="metric-value" style="font-size:22px">${CUR}${A.entry_zones.current_price.toLocaleString()}</div>
           </div>
         </div>` : '<div style="color:var(--muted);font-size:12px">Insufficient data</div>'}
       </div>
@@ -1818,15 +1841,15 @@ function renderResults(A) {
         <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:12px">
           <div style="background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.2);border-radius:10px;padding:12px;text-align:center">
             <div style="font-size:10px;color:var(--red);text-transform:uppercase;letter-spacing:.06em">🐻 Bear</div>
-            <div style="font-family:'Syne',sans-serif;font-size:20px;font-weight:800;color:var(--red);margin-top:4px">₹${A.bear_base_bull.bear ? A.bear_base_bull.bear.toLocaleString() : 'N/A'}</div>
+            <div style="font-family:'Syne',sans-serif;font-size:20px;font-weight:800;color:var(--red);margin-top:4px">${CUR}${A.bear_base_bull.bear ? A.bear_base_bull.bear.toLocaleString() : 'N/A'}</div>
           </div>
           <div style="background:rgba(79,142,247,0.08);border:1px solid rgba(79,142,247,0.2);border-radius:10px;padding:12px;text-align:center">
             <div style="font-size:10px;color:var(--acc);text-transform:uppercase;letter-spacing:.06em">🎯 Base</div>
-            <div style="font-family:'Syne',sans-serif;font-size:20px;font-weight:800;color:var(--acc);margin-top:4px">₹${A.bear_base_bull.base ? A.bear_base_bull.base.toLocaleString() : 'N/A'}</div>
+            <div style="font-family:'Syne',sans-serif;font-size:20px;font-weight:800;color:var(--acc);margin-top:4px">${CUR}${A.bear_base_bull.base ? A.bear_base_bull.base.toLocaleString() : 'N/A'}</div>
           </div>
           <div style="background:rgba(34,197,94,0.08);border:1px solid rgba(34,197,94,0.2);border-radius:10px;padding:12px;text-align:center">
             <div style="font-size:10px;color:var(--green);text-transform:uppercase;letter-spacing:.06em">🐂 Bull</div>
-            <div style="font-family:'Syne',sans-serif;font-size:20px;font-weight:800;color:var(--green);margin-top:4px">₹${A.bear_base_bull.bull ? A.bear_base_bull.bull.toLocaleString() : 'N/A'}</div>
+            <div style="font-family:'Syne',sans-serif;font-size:20px;font-weight:800;color:var(--green);margin-top:4px">${CUR}${A.bear_base_bull.bull ? A.bear_base_bull.bull.toLocaleString() : 'N/A'}</div>
           </div>
         </div>
         <div style="display:flex;flex-direction:column;gap:4px">

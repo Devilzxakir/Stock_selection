@@ -44,6 +44,8 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
 # ── CACHE (in-memory, per-instance) ───────────────────────────────────────────
 _ANALYZE_CACHE = {}              # slug -> (ts, result_dict)
 _ANALYZE_TTL   = timedelta(minutes=15)
+_US_ANALYZE_CACHE = {}           # ticker -> (ts, result_dict)
+_US_ANALYZE_TTL = timedelta(minutes=15)
 _LIVE_CACHE    = {}              # slug -> (ts, dict)
 _LIVE_TTL      = timedelta(minutes=2)
 _RATE_BUCKET   = {}              # ip   -> [timestamps]
@@ -1858,7 +1860,7 @@ def twenty_point_checklist(analyze_result):
         "pass": moat_pass,
         "detail": f"High ROE/ROCE/OPM ({moat_score}/4 indicators positive)" if moat_score >= 2 else "Limited moat indicators",
         "weight": "medium",
-        "reason": f"Moat Score: {moat_score}/4 indicators positive. Components — ROE>20%: {'✅' if latest_roe and latest_roe > 20 else '❌'} ({latest_roe:.1f}%), ROCE>20%: {'✅' if latest_roce and latest_roce > 20 else '❌'} ({latest_roce:.1f}%), OPM>20%: {'✅' if opm and opm > 20 else '❌'} ({opm:.1f}%), Piotroski≥7: {'✅' if pf.get('score') and pf['score'] >= 7 else '❌'} ({pf.get('score', 'N/A')}/9). {'✅ Company shows signs of a competitive moat.' if moat_pass else '❌ Limited evidence of durable competitive advantage.'}"
+        "reason": f"Moat Score: {moat_score}/4 indicators positive. ROE>20%: {'✅' if latest_roe and latest_roe > 20 else '❌'} ({f'{latest_roe:.1f}%' if latest_roe else 'N/A'}), ROCE>20%: {'✅' if latest_roce and latest_roce > 20 else '❌'} ({f'{latest_roce:.1f}%' if latest_roce else 'N/A'}), OPM>20%: {'✅' if opm and opm > 20 else '❌'} ({f'{opm:.1f}%' if opm else 'N/A'}), Piotroski≥7: {'✅' if pf.get('score') and pf['score'] >= 7 else '❌'} ({pf.get('score', 'N/A')}/9). {'✅ Company shows signs of a competitive moat.' if moat_pass else '❌ Limited evidence of durable competitive advantage.'}"
     })
 
     # 10. Management Quality
@@ -2299,10 +2301,12 @@ def scrape_yahoo(slug):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def valuation_engine(eps, bvps, current_price, rev_cagr, pro_cagr,
-                     ebitda_val, total_debt, cash, shares_outstanding):
+                     ebitda_val, total_debt, cash, shares_outstanding, market="India"):
     results  = {}
     g_rate   = (pro_cagr or rev_cagr or 15) / 100
     AAA      = 7.2
+    CUR      = "$" if market == "US" else "₹"
+    CR_CONV  = 1     if market == "US" else 1e7   # Indian values in crores need ×1e7
 
     # Graham Number
     try:
@@ -2310,7 +2314,7 @@ def valuation_engine(eps, bvps, current_price, rev_cagr, pro_cagr,
             gn = math.sqrt(22.5 * eps * bvps)
             results["Graham Number"] = {
                 "iv": round(gn, 2),
-                "formula": f"√(22.5 × EPS {eps:.1f} × BVPS {bvps:.1f})",
+                "formula": f"√(22.5 × EPS {CUR}{eps:.1f} × BVPS {CUR}{bvps:.1f})",
                 "weight": 0.20, "desc": "Benjamin Graham conservative formula"
             }
     except (TypeError, ValueError):
@@ -2318,12 +2322,12 @@ def valuation_engine(eps, bvps, current_price, rev_cagr, pro_cagr,
 
     # Graham Growth
     try:
-        if eps and eps > 0:
-            g_pct = min((pro_cagr or 15), 25)
+        if eps and eps > 0 and pro_cagr is not None and pro_cagr > 0:
+            g_pct = min(pro_cagr, 25)
             gg    = eps * (8.5 + 2 * g_pct) * 4.4 / AAA
             results["Graham Growth"] = {
                 "iv": round(gg, 2),
-                "formula": f"EPS {eps:.1f} × (8.5 + 2×{g_pct:.0f}%) × 4.4 / {AAA}%",
+                "formula": f"EPS {CUR}{eps:.1f} × (8.5 + 2×{g_pct:.0f}%) × 4.4 / {AAA}%",
                 "weight": 0.25, "desc": "Growth-adjusted Graham formula"
             }
     except (TypeError, ValueError):
@@ -2332,8 +2336,10 @@ def valuation_engine(eps, bvps, current_price, rev_cagr, pro_cagr,
     # DCF
     try:
         if eps and eps > 0:
-            r = 0.12
-            g1, g2, gt = min(g_rate, 0.25), min(g_rate * 0.6, 0.15), 0.04
+            r = 0.10 if market == "US" else 0.12
+            g1 = max(min(g_rate, 0.25), 0)          # floor at 0%
+            g2 = max(min(g_rate * 0.6, 0.15), 0)    # floor at 0%
+            gt = 0.03 if market == "US" else 0.04
             fcf = eps
             pv  = 0
             for yr in range(1, 11):
@@ -2343,7 +2349,7 @@ def valuation_engine(eps, bvps, current_price, rev_cagr, pro_cagr,
             dcf  = pv + tv / (1 + r) ** 10
             results["DCF (10yr)"] = {
                 "iv": round(dcf, 2),
-                "formula": f"r=12%, g1={g1*100:.0f}%, g2={g2*100:.0f}%, gT=4%",
+                "formula": f"r={r*100:.0f}%, g1={g1*100:.0f}%, g2={g2*100:.0f}%, gT={gt*100:.0f}%",
                 "weight": 0.30, "desc": "10-year discounted cash flow"
             }
     except (TypeError, ValueError, ZeroDivisionError):
@@ -2357,7 +2363,7 @@ def valuation_engine(eps, bvps, current_price, rev_cagr, pro_cagr,
             peg_actual = (current_price / eps / pro_cagr) if current_price else None
             results["PEG Model"] = {
                 "iv": round(peg_iv, 2),
-                "formula": f"Fair P/E={fair_pe:.0f} (=growth%) × EPS {eps:.1f}",
+                "formula": f"Fair P/E={fair_pe:.0f} (=growth%) × EPS {CUR}{eps:.1f}",
                 "weight": 0.15, "desc": "Peter Lynch PEG=1 fair value",
                 "peg_actual": round(peg_actual, 2) if peg_actual else None
             }
@@ -2371,10 +2377,11 @@ def valuation_engine(eps, bvps, current_price, rev_cagr, pro_cagr,
             EVX  = 14
             debt = total_debt or 0
             c    = cash or 0
-            fair_price = ((EVX * ebitda_val - debt + c) * 1e7) / shares_norm
+            fair_price = ((EVX * ebitda_val - debt + c) * CR_CONV) / shares_norm
+            ebitda_fmt = _fmt_usd(ebitda_val) if market == "US" else f"{CUR}{ebitda_val:.0f}Cr"
             results["EV/EBITDA"] = {
                 "iv": round(fair_price, 2),
-                "formula": f"14x × EBITDA {ebitda_val:.0f}Cr − Debt + Cash / shares",
+                "formula": f"14x × EBITDA {ebitda_fmt} − Debt + Cash / shares",
                 "weight": 0.10, "desc": "Enterprise value to EBITDA multiple"
             }
     except (TypeError, ValueError, ZeroDivisionError):
@@ -2399,7 +2406,7 @@ def valuation_engine(eps, bvps, current_price, rev_cagr, pro_cagr,
     for name, md in results.items():
         key = f"val_{name.lower().replace(' ', '_').replace('(', '').replace(')', '').replace('/', '_')}"
         val_formulas[key] = md.get("formula", "")
-    val_formulas["weighted_iv"] = f"Weighted Average:\n" + " + ".join([f"{m['weight']*100:.0f}% × ₹{m['iv']}" for m in results.values()])
+    val_formulas["weighted_iv"] = f"Weighted Average:\n" + " + ".join([f"{m['weight']*100:.0f}% × {CUR}{m['iv']}" for m in results.values()])
     return {
         "models":        results,
         "weighted_iv":   wtd_iv,
@@ -2418,10 +2425,32 @@ def valuation_engine(eps, bvps, current_price, rev_cagr, pro_cagr,
 # COMPREHENSIVE ANALYSIS ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _fmt_usd(val, dp=1):
+    """Format a raw USD number as $XB / $XM / $XK for display."""
+    if val is None:
+        return None
+    v = float(val)
+    av = abs(v)
+    sign = "-" if v < 0 else ""
+    if av >= 1e12:
+        return f"{sign}${av/1e12:.{dp}f}T"
+    if av >= 1e9:
+        return f"{sign}${av/1e9:.{dp}f}B"
+    if av >= 1e6:
+        return f"{sign}${av/1e6:.{dp}f}M"
+    if av >= 1e3:
+        return f"{sign}${av/1e3:.{dp}f}K"
+    return f"{sign}${av:.{dp}f}"
+
 def series_list(s, n=12):
     if not s: return []
     ks = list(s.keys())[-n:]
     return [{"year": k, "value": s[k]} for k in ks]
+
+def series_list_us(s, n=12):
+    if not s: return []
+    ks = list(s.keys())[-n:]
+    return [{"year": k, "value": s[k], "formatted": _fmt_usd(s[k])} for k in ks]
 
 def analyze_full(company_name, slug, sheets, biz_info, yahoo_data=None):
     """Comprehensive analysis returning all sections including 10 advanced features."""
@@ -3021,8 +3050,8 @@ def analyze_full(company_name, slug, sheets, biz_info, yahoo_data=None):
 # ══════════════════════════════════════════════════════════════════════════════
 
 US_SECTORS = {
-    "Technology": ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "AVGO", "ORCL", "CRM", "ADBE", "INTC", "AMD", "CSCO", "IBM", "QCOM"],
-    "Healthcare": ["JNJ", "UNH", "PFE", "ABBV", "MRK", "TMO", "ABT", "MDT", "BMY", "LLY", "AMGN", "ISRG", "SYK", "BSX", "GILD"],
+    "Technology": ["AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "CRM", "ADBE", "INTC", "AMD", "CSCO", "IBM", "QCOM"],
+    "Healthcare": ["JNJ", "UNH", "PFE", "ABBV", "MRK", "TMO", "ABT", "MDT", "BMY", "LLY", "ISRG", "SYK", "BSX"],
     "Financials": ["JPM", "BAC", "WFC", "C", "GS", "MS", "V", "MA", "AXP", "BLK", "SCHW", "USB", "PNC", "BK", "COF"],
     "Consumer Cyclical": ["TSLA", "AMZN", "HD", "MCD", "NKE", "SBUX", "LOW", "TGT", "GM", "F", "LULU", "TJX", "ROST", "MAR", "BKNG"],
     "Energy": ["XOM", "CVX", "COP", "EOG", "SLB", "OXY", "PSX", "VLO", "MPC", "HAL", "BKR", "HES", "DVN", "FANG", "CTRA"],
@@ -3031,7 +3060,7 @@ US_SECTORS = {
     "Utilities": ["NEE", "DUK", "SO", "D", "AEP", "EXC", "SRE", "PEG", "ED", "XEL", "WEC", "ES", "AWK", "EIX", "DTE"],
     "Real Estate": ["PLD", "AMT", "CCI", "EQIX", "PSA", "O", "DLR", "SPG", "WY", "AVB", "EQR", "WELL", "ARE", "BXP", "VICI"],
     "Basic Materials": ["LIN", "SHW", "APD", "ECL", "FCX", "NEM", "DOW", "DD", "PPG", "NUE", "STLD", "ALB", "MOS", "CF", "EMN"],
-    "Biotechnology": ["AMGN", "GILD", "REGN", "VRTX", "BIIB", "ILMN", "MRNA", "ALXN", "INCY", "UTHR", "EXEL", "NBIX", "ALNY", "SRPT", "BGNE"],
+    "Biotechnology": ["REGN", "VRTX", "BIIB", "ILMN", "MRNA", "ALXN", "INCY", "UTHR", "EXEL", "NBIX", "ALNY", "SRPT", "BGNE", "AMGN", "GILD"],
     "Consumer Defensive": ["PG", "KO", "PEP", "WMT", "COST", "CL", "KMB", "MDLZ", "KHC", "GIS", "CPB", "SJM", "CAG", "HRL", "K"],
 }
 
@@ -3056,45 +3085,66 @@ def _us_label(ticker, info=None):
 
 
 def us_search(q):
-    """Search US stocks by ticker or name."""
+    """Search US stocks by ticker or company name using Yahoo Finance search API."""
     import yfinance as yf
-    q = q.strip().upper()
     results = []
-    # Search by ticker exact
+    q_upper = q.strip().upper()
+    q_lower = q.strip().lower()
+    NON_US = {"SAO", "NEO", "MX", "FRA", "EPA", "LON", "TSE", "HKG", "SHA", "SYD",
+              "NSE", "BSE", "JKT", "SET", "KLSE", "PSE", "VIH", "SGO", "BUE",
+              "MEX", "CSE", "STU", "MUN", "DUS", "BER", "HAM", "GER", "AMS",
+              "BRU", "MIL", "TOR", "VAN", "CNQ", "ASX", "NZE", "OSL", "STO",
+              "CPH", "WSE", "PRA", "BUD", "IST", "WSE", "RIS", "LIT", "LAT",
+              "TAL", "UKX", "FSX", "SWX", "CDI", "IOB", "NOK", "OMC", "ICX",
+              "KSC", "TWO", "TAI", "KUW", "ADX", "DFM", "QAT", "BAH", "EGX",
+              "JSE", "Cairo", "DFM", "ADX"}
+
+    # 1. Yahoo Finance search API (fast, single HTTP call)
     try:
-        tk = yf.Ticker(q)
-        info = tk.info or {}
-        if info.get("longName") or info.get("shortName"):
-            results.append(_us_label(q, info))
-    except (KeyError, TypeError):
-        pass
-    # Search by name in sector lists
-    for sector, tickers in US_SECTORS.items():
-        for t in tickers:
-            if q in t or (len(q) >= 2 and t.startswith(q)):
-                if not any(r["ticker"] == t for r in results):
-                    try:
-                        tk = yf.Ticker(t)
-                        results.append(_us_label(t, tk.info or {}))
-                    except (KeyError, TypeError):
-                        results.append({"ticker": t, "name": t, "sector": sector, "industry": "", "price": ""})
+        import requests as _rq
+        sr = _rq.get(
+            "https://query2.finance.yahoo.com/v1/finance/search",
+            params={"q": q, "quotesCount": 10, "newsCount": 0,
+                    "listsCount": 0, "types": "equity"},
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=5,
+        )
+        if sr.ok:
+            for item in sr.json().get("quotes", []):
+                sym = item.get("symbol", "")
+                exch = item.get("exchange", "")
+                if item.get("quoteType") == "EQUITY" and sym:
+                    if exch in NON_US:
+                        continue
+                    name = item.get("longname") or item.get("shortname") or sym
+                    sector = item.get("sector", "")
+                    industry = item.get("industry", "")
+                    results.append({
+                        "ticker": sym,
+                        "name": name,
+                        "sector": sector,
+                        "industry": industry,
+                        "price": "",
+                        "exchange": exch,
+                    })
                     if len(results) >= 6:
                         break
-        if len(results) >= 6:
-            break
+    except Exception:
+        pass
+
+    # 2. Fallback: direct ticker lookup if search returned nothing
+    if not results:
+        try:
+            tk = yf.Ticker(q_upper)
+            info = tk.info or {}
+            if info.get("longName") or info.get("shortName"):
+                results.append(_us_label(q_upper, info))
+        except (KeyError, TypeError):
+            pass
+
     return results[:6]
 
 
-def _yh_metric(fin_df, keywords):
-    """Find a row in yfinance DataFrame by keyword matching."""
-    if fin_df is None or fin_df.empty:
-        return {}
-    for idx in fin_df.index:
-        idx_str = str(idx).lower()
-        if any(kw.lower() in idx_str for kw in keywords):
-            series = fin_df.loc[idx]
-            return {str(col.year): round(float(val), 2) if val is not None and pd.notna(val) else None for col, val in zip(series.index, series.values)}
-    return {}
 
 
 def fetch_us_financials(ticker):
@@ -3112,7 +3162,7 @@ def fetch_us_financials(ticker):
             return None
 
     def collect(fin_df):
-        """Convert yfinance DataFrame to {metric: {year: val}}."""
+        """Convert yfinance DataFrame to {metric: {year: val}} — sorted oldest-first."""
         d = {}
         if fin_df is None or fin_df.empty:
             return d
@@ -3126,7 +3176,7 @@ def fetch_us_financials(ticker):
                     if num is not None:
                         yr_vals[yr] = num
             if yr_vals:
-                d[str(idx)] = yr_vals
+                d[str(idx)] = dict(sorted(yr_vals.items()))
         return d
 
     pl_raw = collect(tk.financials)
@@ -3282,12 +3332,10 @@ def fetch_us_financials(ticker):
 
 
 def analyze_us_stock(ticker):
-    """Full analysis of a US stock using the same investor frameworks."""
-    import yfinance as yf
+    """Full analysis of a US stock using the same investor frameworks as Indian stocks."""
     sections = fetch_us_financials(ticker)
     info = sections.get("_info", {})
 
-    # Extract data for analysis functions
     pl = sections.get("Profit & Loss", {}).get("data", {})
     bs = sections.get("Balance Sheet", {}).get("data", {})
     cf = sections.get("Cash Flow", {}).get("data", {})
@@ -3310,9 +3358,11 @@ def analyze_us_stock(ticker):
     cfo_d = cf.get("Cash from Operating Activity", {})
     fcf_d = cf.get("Free Cash Flow", {})
 
+    eps_ser = key.get("EPS", {})
+
     rev_cagr_v = cagr(fv(sales_d), lv(sales_d), yrs(sales_d)) if sales_d else None
     pro_cagr_v = cagr(fv(profit_d), lv(profit_d), yrs(profit_d)) if profit_d else None
-    eps_cagr_v = cagr(fv(key.get("EPS", {})), lv(key.get("EPS", {})), yrs(key.get("EPS", {}))) if key.get("EPS") else None
+    eps_cagr_v = cagr(fv(eps_ser), lv(eps_ser), yrs(eps_ser)) if eps_ser else None
 
     latest_price_v = lv(key.get("Price", {}))
     latest_eps_v = lv(key.get("EPS", {}))
@@ -3322,6 +3372,16 @@ def analyze_us_stock(ticker):
     latest_de_v = lv(key.get("Debt/Equity", {}))
     latest_opm_v = lv(key.get("OPM", {}))
     latest_nm_v = lv(key.get("Net Margin", {}))
+
+    latest_em_v = None
+    if ebitda_d and sales_d:
+        ebitda_l = lv(ebitda_d)
+        sales_l = lv(sales_d)
+        if ebitda_l and sales_l and sales_l > 0:
+            latest_em_v = round((ebitda_l / sales_l) * 100, 1)
+    if latest_em_v is None and info.get("operatingMargins") is not None:
+        latest_em_v = round(float(info["operatingMargins"]) * 100, 1)
+
     latest_int_cov = None
     if op_d and int_d:
         op_l = lv(op_d)
@@ -3342,9 +3402,8 @@ def analyze_us_stock(ticker):
         vals = list(borrowings_d.values())
         debt_reduced = vals[-1] < vals[-2]
     cfo_val = lv(cfo_d) or info.get("operatingCashflow")
-    cfo_positive = (cfo_val or 0) > 0
+    cfo_positive = (cfo_val or 0) > 0 if cfo_val is not None else None
 
-    # Growth consistency
     sales_vals = list(sales_d.values())
     profit_vals = list(profit_d.values())
     sales_growth_years = []
@@ -3360,13 +3419,19 @@ def analyze_us_stock(ticker):
                          sum(1 for g in profit_growth_years if g > 0) >= 2)
 
     mcap = info.get("marketCap")
-    mcap_cr = round(mcap / 1e7, 2) if mcap else None  # approximate for score_val
+    mcap_b = round(mcap / 1e9, 2) if mcap else None
+    mcap_category = "N/A"
+    if mcap_b:
+        if mcap_b >= 200: mcap_category = "Mega Cap"
+        elif mcap_b >= 10: mcap_category = "Large Cap"
+        elif mcap_b >= 2: mcap_category = "Mid Cap"
+        else: mcap_category = "Small Cap"
+
     promoter_info = None
     inst_holding = info.get("heldPercentInstitutions")
     if inst_holding is not None:
         inst_holding = round(inst_holding * 100, 1)
 
-    # Scores
     scores = {}
     scores["Revenue Growth"] = score_cagr(rev_cagr_v)
     scores["Profit Growth"] = score_cagr(pro_cagr_v)
@@ -3389,7 +3454,6 @@ def analyze_us_stock(ticker):
     sector = info.get("sector", "N/A")
     industry = info.get("industry", "N/A")
 
-    # Valuation using info-based metrics
     val = None
     if latest_price_v and latest_eps_v and latest_eps_v > 0:
         val = valuation_engine(
@@ -3399,43 +3463,75 @@ def analyze_us_stock(ticker):
             ebitda_val=lv(ebitda_d),
             total_debt=lv(borrowings_d), cash=lv(cash_d),
             shares_outstanding=info.get("sharesOutstanding"),
+            market="US",
         )
 
-    # Business info
     biz_info = {
         "industry": industry,
         "sector": sector,
-        "description": info.get("longBusinessSummary", "")[:200],
-        "market_cap": mcap_cr,
+        "description": info.get("longBusinessSummary", ""),
+        "market_cap": mcap_b,
+        "market_cap_category": mcap_category,
         "promoter_holding": None,
         "institutional_holding": inst_holding,
     }
 
     risks = []
     if latest_de_v and latest_de_v > 1.0: risks.append("High Debt-to-Equity ratio")
-    if not cfo_positive: risks.append("Negative operating cash flow")
+    if cfo_positive is False: risks.append("Negative operating cash flow")
     if rev_cagr_v is None or (rev_cagr_v < 5): risks.append("Slow or negative revenue growth")
     if latest_int_cov and latest_int_cov < 2: risks.append("Low interest coverage")
 
-    # Piotroski
     piotroski, piotroski_details = piotroski_f_score(pl, bs, cf, key)
-
-    # Altman
     altman = altman_z_score(pl, bs, key, latest_price_v, info.get("sharesOutstanding"))
-
-    # Earnings quality
     eq = earnings_quality_analysis(cfo_d, profit_d)
-
-    # Revenue acceleration
     rev_acc = revenue_acceleration(sales_d)
-
-    # Entry zones
     zones = entry_zones(latest_price_v, val)
-
-    # Magic Formula
     mf = magic_formula_rank(key, pl, bs, latest_price_v, info.get("sharesOutstanding"))
 
-    # Investor Frameworks
+    checklist = {
+        "Growth": scores["Revenue Growth"],
+        "Profitability": round((scores["Oper. Margin"] + scores["ROE"] + scores["ROCE"]) / 3, 1),
+        "Debt": scores["Debt Mgmt"],
+        "Cash Flow": scores["Cash Flow"],
+        "Valuation": score_val(val["upside_pct"] if val else None, [(30,9),(10,7),(-10,5),(-30,3)]) if val else 5,
+        "Consistency": 8 if consistent_growth else 5,
+    }
+
+    growth_potential = "Low"
+    if rev_cagr_v and rev_cagr_v > 15: growth_potential = "High"
+    elif rev_cagr_v and rev_cagr_v > 8: growth_potential = "Moderate"
+
+    div_potential = "Low"
+    if latest_eps_v and latest_price_v and (latest_eps_v / latest_price_v) > 0.02:
+        div_potential = "Moderate"
+
+    debt_level = "High" if (latest_de_v or 0) > 1.0 else "Moderate" if (latest_de_v or 0) > 0.5 else "Low"
+
+    osig = overall_signal(scores, overall, val, risks, piotroski, promoter_info)
+
+    interest_coverage_analysis = {
+        "latest": latest_int_cov,
+        "trend": [],
+        "status": "Safe" if latest_int_cov and latest_int_cov > 3 else "Moderate" if latest_int_cov and latest_int_cov > 1.5 else "Concerning",
+    }
+
+    if val and val.get("weighted_iv"):
+        iv = val["weighted_iv"]
+        cp = latest_price_v
+        bbb = {
+            "bear": round(min(cp * 0.85, iv * 0.7), 2) if cp and iv else None,
+            "base": round(iv, 2),
+            "bull": round(max(iv * 1.3, cp * 1.5), 2) if cp and iv else None,
+            "description": {
+                "bear": "Pessimistic — 30% below fair value or 15% below CMP",
+                "base": "Fair value as per weighted intrinsic value",
+                "bull": "Optimistic — 30% above fair value or 50% above CMP",
+            }
+        }
+    else:
+        bbb = None
+
     fw_buffett = buffett_score(pl, bs, cf, key,
                     latest_roe_v, latest_roce_v, latest_opm_v, latest_de_v,
                     latest_int_cov, cfo_positive, rev_cagr_v, pro_cagr_v,
@@ -3452,12 +3548,12 @@ def analyze_us_stock(ticker):
     fw_fisher = fisher_score(pl, bs, key,
                     latest_opm_v, latest_roe_v, latest_roce_v, latest_de_v,
                     rev_cagr_v, pro_cagr_v, consistent_growth, cfo_positive,
-                    debt_reduced, promoter_info, inst_holding, industry, mcap_cr)
+                    debt_reduced, promoter_info, inst_holding, industry, mcap_b)
     fw_canslim = canslim_score(pl, bs, key,
                     latest_eps_v, latest_pe_v, latest_roe_v, latest_opm_v,
-                    rev_cagr_v, pro_cagr_v, key.get("EPS", {}), sales_d, profit_d,
+                    rev_cagr_v, pro_cagr_v, eps_ser, sales_d, profit_d,
                     latest_price_v, info.get("sharesOutstanding"), promoter_info,
-                    inst_holding, mcap_cr, industry, consistent_growth,
+                    inst_holding, mcap_b, industry, consistent_growth,
                     rev_acc.get("status", "Insufficient data"))
 
     framework_results = [fw_buffett, fw_lynch, fw_munger, fw_fisher, fw_canslim]
@@ -3466,7 +3562,7 @@ def analyze_us_stock(ticker):
     result = {
         "company_name": company_name,
         "ticker": ticker,
-        "market": "India",
+        "market": "US",
         "generated_at": datetime.now().strftime("%d %b %Y %H:%M"),
         "business": biz_info,
         "metrics": {
@@ -3485,25 +3581,71 @@ def analyze_us_stock(ticker):
             "interest_coverage": round(latest_int_cov, 1) if latest_int_cov else None,
             "net_margin": round(latest_nm_v, 1) if latest_nm_v else None,
             "ebitda_margin": round(latest_em_v, 1) if latest_em_v else None,
-            # Yahoo Finance enriched fields
-            "forward_pe": yahoo_data.get("forward_pe") if yahoo_data else None,
-            "forward_eps": yahoo_data.get("forward_eps") if yahoo_data else None,
-            "beta": yahoo_data.get("beta") if yahoo_data else None,
-            "fifty_two_week_high": yahoo_data.get("fifty_two_week_high") if yahoo_data else None,
-            "fifty_two_week_low": yahoo_data.get("fifty_two_week_low") if yahoo_data else None,
-            "fifty_day_avg": yahoo_data.get("fifty_day_avg") if yahoo_data else None,
-            "two_hundred_day_avg": yahoo_data.get("two_hundred_day_avg") if yahoo_data else None,
-            "analyst_target": yahoo_data.get("analyst_target") if yahoo_data else None,
-            "revenue_growth_yf": yahoo_data.get("revenue_growth") if yahoo_data else None,
+            "forward_pe": info.get("forwardPE"),
+            "forward_eps": info.get("forwardEps"),
+            "beta": info.get("beta"),
+            "fifty_two_week_high": info.get("fiftyTwoWeekHigh"),
+            "fifty_two_week_low": info.get("fiftyTwoWeekLow"),
+            "fifty_day_avg": info.get("fiftyDayAverage"),
+            "two_hundred_day_avg": info.get("twoHundredDayAverage"),
+            "analyst_target": info.get("targetMeanPrice"),
+            "revenue_growth_yf": round(info["revenueGrowth"] * 100, 1) if info.get("revenueGrowth") else None,
         },
         "series": {
-            "sales": series_list(sales_d, 8),
-            "profit": series_list(profit_d, 8),
-            "ebitda": series_list(ebitda_d, 8),
-            "borrowings": series_list(borrowings_d, 8),
-            "reserves": series_list(reserves_d, 8),
-            "cfo": series_list(cfo_d, 8),
+            "sales": series_list_us(sales_d, 12),
+            "profit": series_list_us(profit_d, 12),
+            "ebitda": series_list_us(ebitda_d, 12),
+            "borrowings": series_list_us(borrowings_d, 12),
+            "reserves": series_list_us(reserves_d, 12),
+            "cfo": series_list_us(cfo_d, 12),
         },
+        "ratios": {
+            "valuation": {
+                "P/E": fmt(latest_pe_v, "x", 1),
+                "PEG": fmt(val.get("peg_actual") if val else None, "", 2) if val and val.get("peg_actual") else "N/A",
+                "P/BV": fmt(latest_price_v / latest_bvps_v, "x", 1) if latest_price_v and latest_bvps_v and latest_bvps_v > 0 else "N/A",
+            },
+            "profitability": {
+                "ROE": fmt(latest_roe_v, "%", 1),
+                "ROCE": fmt(latest_roce_v, "%", 1),
+                "OPM": fmt(latest_opm_v, "%", 1),
+                "Net Margin": fmt(latest_nm_v, "%", 1),
+            },
+            "debt": {
+                "D/E": fmt(latest_de_v, "x", 2),
+                "Interest Coverage": fmt(latest_int_cov, "x", 1),
+            },
+        },
+        "balance_sheet": {
+            "debt_trend": "Reducing" if debt_reduced else "Increasing",
+            "debt_level": debt_level,
+            "cash_reserves": lv(cash_d),
+            "borrowings_latest": lv(borrowings_d),
+            "reserves_latest": lv(reserves_d),
+            "cash_reserves_fmt": _fmt_usd(lv(cash_d)),
+            "borrowings_latest_fmt": _fmt_usd(lv(borrowings_d)),
+            "reserves_latest_fmt": _fmt_usd(lv(reserves_d)),
+        },
+        "cash_flow": {
+            "cfo_positive": cfo_positive,
+            "cfo_latest": lv(cfo_d),
+            "cfo_latest_fmt": _fmt_usd(lv(cfo_d)),
+            "profit_cash_consistent": "Good" if cfo_positive and lv(cfo_d) and lv(profit_d) and abs(lv(cfo_d)/lv(profit_d)) > 0.5 else "Weak",
+        },
+        "growth": {
+            "rev_cagr": rev_cagr_v,
+            "pro_cagr": pro_cagr_v,
+            "consistent_growth": "Yes" if consistent_growth else "No",
+            "growth_potential": growth_potential,
+            "eps_cagr": eps_cagr_v,
+        },
+        "long_term": {
+            "growth_potential": growth_potential,
+            "dividend_potential": div_potential,
+            "multibagger_possibility": "High" if (rev_cagr_v and rev_cagr_v > 20 and latest_de_v and latest_de_v < 0.5) else "Moderate" if (rev_cagr_v and rev_cagr_v > 10) else "Low",
+        },
+        "checklist": checklist,
+        "checklist_overall": round(sum(checklist.values()) / len(checklist), 1),
         "val": val,
         "risks": risks,
         "scores": scores,
@@ -3517,12 +3659,36 @@ def analyze_us_stock(ticker):
         "altman_z": altman,
         "entry_zones": zones,
         "magic_formula": mf,
-        "overall_signal": overall_signal(scores, overall, val, risks, piotroski, promoter_info),
+        "overall_signal": osig,
         "industry_future": assess_industry_future(industry),
         "economic_sensitivity": assess_economic_sensitivity(industry, latest_de_v, latest_int_cov),
         "institutional_assessment": assess_institutional_buying(inst_holding, promoter_info),
+        "interest_coverage_analysis": interest_coverage_analysis,
+        "bear_base_bull": bbb,
         "investor_frameworks": {"frameworks": framework_results, "overall": fw_overall},
     }
+
+    result["red_flags"] = detect_red_flags(
+        pl=pl, bs=bs, cf=cf, key=key,
+        sales=sales_d, profit=profit_d, borrowings=borrowings_d, cfo=cfo_d,
+        promoter_holding=None,
+        rev_cagr=rev_cagr_v, pro_cagr=pro_cagr_v,
+        latest_de=latest_de_v, latest_pe=latest_pe_v,
+        latest_roe=latest_roe_v, latest_roce=latest_roce_v,
+        latest_int_cov=latest_int_cov, debt_reduced=debt_reduced,
+        cfo_positive=cfo_positive, eps_ser=eps_ser,
+        industry=industry,
+    )
+
+    twenty_point = twenty_point_checklist(result)
+    buy_gate = buy_confirmation_gate(twenty_point, result["red_flags"], val, overall)
+    result["twenty_point_checklist"] = twenty_point
+    result["buy_confirmation"] = buy_gate
+    result["management_quality"] = assess_management_quality(
+        None, "Reducing" if debt_reduced else "Increasing",
+        latest_roce_v, latest_roe_v
+    )
+
     return result
 
 
@@ -4015,14 +4181,25 @@ def us_analyze_route():
     if not TICKER_RE.match(ticker):
         return jsonify({"error": "Invalid ticker format"}), 400
     try:
+        now = datetime.now()
+        cache_entry = _US_ANALYZE_CACHE.get(ticker)
+        if cache_entry and (now - cache_entry[0]) < _US_ANALYZE_TTL:
+            log.info("Cache hit for /api/us/analyze ticker=%s", ticker)
+            resp = jsonify(cache_entry[1])
+            resp.headers["Cache-Control"] = "public, max-age=900"
+            return resp
+
         result = analyze_us_stock(ticker)
-        # Inject sector context for peer comparison
         fw_results = result.get("investor_frameworks", {}).get("frameworks", [])
         result["sector_context"] = compute_sector_context(
             ticker, fw_results, result.get("overall")
         )
+        _US_ANALYZE_CACHE[ticker] = (now, result)
+        for k, (ts, _) in list(_US_ANALYZE_CACHE.items()):
+            if (now - ts) > _US_ANALYZE_TTL:
+                del _US_ANALYZE_CACHE[k]
         resp = jsonify(result)
-        resp.headers["Cache-Control"] = "no-store"
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         return resp
     except Exception as e:
         log.exception("/api/us/analyze failed for ticker=%s", ticker)
