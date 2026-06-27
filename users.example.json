@@ -1,6 +1,0 @@
-{
-  "email@example.com": {
-    "name": "Your Name",
-    "password": "<generate with werkzeug.security.generate_password_hash>"
-  }
-}

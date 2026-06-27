@@ -4,12 +4,10 @@ Run: python app.py
 Visit: http://localhost:5000
 """
 
-from flask import Flask, request, jsonify, render_template, send_file, session, redirect, url_for
-from werkzeug.security import generate_password_hash, check_password_hash
-from functools import wraps
+from flask import Flask, request, jsonify, render_template, send_file
 import requests as req
 import pandas as pd
-import math, re, os, io, json
+import math, re, os, io
 from datetime import datetime, timedelta
 from io import BytesIO
 
@@ -24,30 +22,6 @@ from reportlab.platypus import (
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "stocksense-dev-key-change-in-prod")
-app.permanent_session_lifetime = timedelta(days=7)
-USERS_FILE = "users.json"
-
-# ── AUTH HELPERS ──────────────────────────────────────────────────────────────
-def load_users():
-    env_json = os.environ.get("USERS_JSON")
-    if env_json:
-        try: return json.loads(env_json)
-        except: pass
-    if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, "r") as f: return json.load(f)
-    return {}
-
-def save_users(users):
-    with open(USERS_FILE, "w") as f: json.dump(users, f, indent=2)
-
-def login_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if "user" not in session:
-            return redirect(url_for("login"))
-        return f(*args, **kwargs)
-    return decorated
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 SESSION_ID = os.environ.get("SESSION_ID", "wd45cahfg2g5q6tqyabmkfw7zjih1bbb")
@@ -394,7 +368,7 @@ def yrs(s):
     return len(k) - 1 if len(k) > 1 else 1
 
 def cagr(start, end, n):
-    if not start or not end or start <= 0 or n <= 0:
+    if not start or not end or start <= 0 or end <= 0 or n <= 0:
         return None
     return round(((end / start) ** (1 / n) - 1) * 100, 1)
 
@@ -674,6 +648,459 @@ def magic_formula_rank(key, pl, bs, price, shares_outstanding):
         }
     except:
         return {"roce": None, "earnings_yield": None}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INVESTOR FRAMEWORK SCORING ENGINES (0-100 each)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _clip(v, lo=0, hi=100):
+    return max(lo, min(hi, v))
+
+def _framework_base(name, investor_tagline):
+    return {"framework": name, "tagline": investor_tagline, "score": 0, "max": 100, "components": {}, "verdict": "Insufficient data"}
+
+def _fw_verdict(score):
+    if score >= 80: return "STRONG BUY"
+    if score >= 60: return "BUY"
+    if score >= 40: return "HOLD"
+    if score >= 20: return "CAUTION"
+    return "AVOID"
+
+def buffett_score(pl, bs, cf, key, latest_roe_v, latest_roce_v, latest_opm_v, latest_de_v, latest_int_cov, cfo_positive, rev_cagr_v, pro_cagr_v, consistent_growth, debt_reduced, industry):
+    """Warren Buffett — Buy wonderful businesses at fair prices.
+    Durable moat, consistent ROE, low debt, owner earnings."""
+    fw = _framework_base("Buffett (Buffettology)",
+        '"It\'s far better to buy a wonderful company at a fair price than a fair company at a wonderful price."')
+    c = {}
+    s = 0
+
+    # 1. ROE quality (30 pts)
+    roe_score = 0
+    if latest_roe_v:
+        if latest_roe_v >= 25: roe_score = 30
+        elif latest_roe_v >= 20: roe_score = 26
+        elif latest_roe_v >= 15: roe_score = 20
+        elif latest_roe_v >= 10: roe_score = 12
+        else: roe_score = 5
+    c["ROE Quality"] = {"score": roe_score, "max": 30, "detail": f"ROE: {latest_roe_v}% (threshold: >15% sustained)" if latest_roe_v else "N/A"}
+    s += roe_score
+
+    # 2. Durable competitive advantage (25 pts)
+    moat_score = 0
+    if latest_roce_v and latest_roce_v > 20: moat_score += 8
+    elif latest_roce_v and latest_roce_v > 15: moat_score += 5
+    if latest_opm_v and latest_opm_v > 20: moat_score += 8
+    elif latest_opm_v and latest_opm_v > 15: moat_score += 5
+    if latest_roe_v and latest_roe_v > 20: moat_score += 9
+    elif latest_roe_v and latest_roe_v > 15: moat_score += 5
+    moat_score = min(moat_score, 25)
+    c["Moat (Durable Advantage)"] = {"score": moat_score, "max": 25, "detail": f"ROCE: {latest_roce_v}%, OPM: {latest_opm_v}%, ROE: {latest_roe_v}%" if latest_roce_v else "N/A"}
+    s += moat_score
+
+    # 3. Low debt (15 pts)
+    debt_score = 0
+    if latest_de_v is not None:
+        if latest_de_v < 0.25: debt_score = 15
+        elif latest_de_v < 0.5: debt_score = 13
+        elif latest_de_v < 1.0: debt_score = 9
+        elif latest_de_v < 2.0: debt_score = 5
+        else: debt_score = 2
+    if debt_reduced: debt_score = min(debt_score + 2, 15)
+    if latest_int_cov and latest_int_cov < 2: debt_score = max(debt_score - 4, 0)
+    c["Debt Discipline"] = {"score": debt_score, "max": 15, "detail": f"D/E: {latest_de_v}" if latest_de_v is not None else "N/A"}
+    s += debt_score
+
+    # 4. Owner earnings quality (15 pts)
+    eq_score = 0
+    if cfo_positive: eq_score += 8
+    np_vals = list(pl.get("Net profit", {}).values()) if pl else []
+    cfo_vals = list(cf.get("Cash from Operating Activity", {}).values()) if cf else []
+    if len(cfo_vals) >= 1 and len(np_vals) >= 1 and cfo_vals[-1] and np_vals[-1] and np_vals[-1] > 0:
+        ratio = cfo_vals[-1] / np_vals[-1]
+        if ratio > 1.0: eq_score += 7
+        elif ratio > 0.7: eq_score += 5
+        elif ratio > 0.3: eq_score += 3
+    c["Owner Earnings Quality"] = {"score": eq_score, "max": 15, "detail": f"CFO positive: {cfo_positive}"}
+    s += eq_score
+
+    # 5. Consistent earnings growth (15 pts)
+    gr_score = 0
+    if consistent_growth: gr_score += 5
+    if rev_cagr_v and rev_cagr_v > 10: gr_score += 5
+    elif rev_cagr_v and rev_cagr_v > 5: gr_score += 3
+    if pro_cagr_v and pro_cagr_v > 12: gr_score += 5
+    elif pro_cagr_v and pro_cagr_v > 5: gr_score += 3
+    gr_score = min(gr_score, 15)
+    c["Earnings Consistency"] = {"score": gr_score, "max": 15, "detail": f"Rev CAGR: {rev_cagr_v}%, Profit CAGR: {pro_cagr_v}%"}
+    s += gr_score
+
+    s = _clip(s)
+    fw["score"] = round(s, 1)
+    fw["components"] = c
+    fw["verdict"] = _fw_verdict(s)
+    return fw
+
+
+def lynch_score(pl, bs, key, latest_pe_v, latest_eps_v, latest_de_v, latest_roe_v, latest_opm_v, rev_cagr_v, pro_cagr_v, consistent_growth, cfo_positive, promoter_info, inst_holding):
+    """Peter Lynch — Growth at a reasonable price (GARP).
+    PEG < 1, understand the business, debt-free, earnings story."""
+    fw = _framework_base("Lynch (GARP)",
+        '"Know what you own, and know why you own it."')
+    c = {}
+    s = 0
+
+    # 1. PEG Ratio (25 pts)
+    peg_score = 0
+    if latest_pe_v and latest_eps_v and pro_cagr_v and pro_cagr_v > 0 and latest_pe_v > 0:
+        peg = latest_pe_v / pro_cagr_v
+        if peg < 0.5: peg_score = 25
+        elif peg < 0.8: peg_score = 22
+        elif peg < 1.0: peg_score = 18
+        elif peg < 1.5: peg_score = 12
+        elif peg < 2.0: peg_score = 6
+        else: peg_score = 2
+        c["PEG Ratio"] = {"score": peg_score, "max": 25, "detail": f"PEG: {peg:.2f} (P/E {latest_pe_v}x / Growth {pro_cagr_v}%)"}
+    else:
+        c["PEG Ratio"] = {"score": 0, "max": 25, "detail": "Insufficient data"}
+    s += peg_score
+
+    # 2. Debt-free or low debt (20 pts)
+    debt_score = 0
+    if latest_de_v is not None:
+        if latest_de_v < 0.1: debt_score = 20
+        elif latest_de_v < 0.3: debt_score = 17
+        elif latest_de_v < 0.5: debt_score = 14
+        elif latest_de_v < 1.0: debt_score = 8
+        elif latest_de_v < 2.0: debt_score = 4
+        else: debt_score = 1
+    c["Balance Sheet Strength"] = {"score": debt_score, "max": 20, "detail": f"D/E: {latest_de_v}" if latest_de_v is not None else "N/A"}
+    s += debt_score
+
+    # 3. Earnings story (20 pts)
+    earn_score = 0
+    if consistent_growth: earn_score += 5
+    if pro_cagr_v and pro_cagr_v > 15: earn_score += 8
+    elif pro_cagr_v and pro_cagr_v > 10: earn_score += 5
+    elif pro_cagr_v and pro_cagr_v > 5: earn_score += 3
+    if rev_cagr_v and rev_cagr_v > 10: earn_score += 5
+    elif rev_cagr_v and rev_cagr_v > 5: earn_score += 3
+    if latest_roe_v and latest_roe_v > 15: earn_score += 2
+    earn_score = min(earn_score, 20)
+    c["Earnings Story"] = {"score": earn_score, "max": 20, "detail": f"Profit CAGR: {pro_cagr_v}%, Consistent: {consistent_growth}"}
+    s += earn_score
+
+    # 4. Cash flow health (15 pts)
+    cf_score = 0
+    if cfo_positive: cf_score += 8
+    np_vals = list(pl.get("Net profit", {}).values()) if pl else []
+    if np_vals and len(np_vals) >= 3:
+        losses = sum(1 for v in np_vals[-3:] if v and v < 0)
+        if losses == 0: cf_score += 7
+        elif losses <= 1: cf_score += 4
+    c["Cash Flow Health"] = {"score": cf_score, "max": 15, "detail": f"CFO positive: {cfo_positive}"}
+    s += cf_score
+
+    # 5. Company type & institutional sweet spot (20 pts)
+    type_score = 0
+    if latest_opm_v and latest_opm_v > 20: type_score += 5
+    if latest_roe_v and latest_roe_v > 20: type_score += 5
+    if inst_holding is not None:
+        if 10 <= inst_holding <= 60:
+            type_score += 5
+        elif inst_holding > 60:
+            type_score += 2
+    if promoter_info and promoter_info > 50: type_score += 5
+    elif promoter_info and promoter_info > 30: type_score += 3
+    type_score = min(type_score, 20)
+    c["Company Type & Smart Money"] = {"score": type_score, "max": 20, "detail": f"Institutional: {inst_holding}%, Promoter: {promoter_info}%" if inst_holding else "N/A"}
+    s += type_score
+
+    s = _clip(s)
+    fw["score"] = round(s, 1)
+    fw["components"] = c
+    fw["verdict"] = _fw_verdict(s)
+    return fw
+
+
+def munger_score(latest_roe_v, latest_roce_v, latest_opm_v, latest_de_v, latest_int_cov, rev_cagr_v, pro_cagr_v, consistent_growth, debt_reduced, cfo_positive, piotroski, altman_zone, industry, red_flags_list, promoter_info):
+    """Charlie Munger — Invert, always invert. Mental models, moat, rationality.
+    Lollapalooza effect: multiple factors compounding together."""
+    fw = _framework_base("Munger (Mental Models)",
+        '"The big money is not in the buying and selling, but in the waiting."')
+    c = {}
+    s = 0
+
+    # 1. Lollapalooza — multiple reinforcing factors (30 pts)
+    lollapalooza = 0
+    if latest_roe_v and latest_roe_v > 20: lollapalooza += 6
+    if latest_roce_v and latest_roce_v > 20: lollapalooza += 6
+    if latest_opm_v and latest_opm_v > 20: lollapalooza += 6
+    if consistent_growth: lollapalooza += 6
+    if latest_de_v is not None and latest_de_v < 0.3: lollapalooza += 6
+    elif latest_de_v is not None and latest_de_v < 0.5: lollapalooza += 4
+    lollapalooza = min(lollapalooza, 30)
+    c["Lollapalooza Effect"] = {"score": lollapalooza, "max": 30, "detail": "Reinforcing factors: ROE, ROCE, OPM, growth, low debt"}
+    s += lollapalooza
+
+    # 2. Circle of competence / predictability (25 pts)
+    pred_score = 0
+    if consistent_growth: pred_score += 6
+    if rev_cagr_v and rev_cagr_v > 10: pred_score += 5
+    elif rev_cagr_v and rev_cagr_v > 5: pred_score += 3
+    if pro_cagr_v and pro_cagr_v > 10: pred_score += 5
+    elif pro_cagr_v and pro_cagr_v > 5: pred_score += 3
+    if latest_int_cov and latest_int_cov > 3: pred_score += 5
+    elif latest_int_cov and latest_int_cov > 2: pred_score += 3
+    if cfo_positive: pred_score += 4
+    pred_score = min(pred_score, 25)
+    c["Predictability (Circle of Competence)"] = {"score": pred_score, "max": 25, "detail": f"Consistent growth: {consistent_growth}, Interest coverage: {latest_int_cov}"}
+    s += pred_score
+
+    # 3. Inversion — absence of red flags (20 pts)
+    inv_score = 20
+    critical_count = sum(1 for f in red_flags_list if f.get("severity") == "critical") if red_flags_list else 0
+    high_count = sum(1 for f in red_flags_list if f.get("severity") == "high") if red_flags_list else 0
+    inv_score -= critical_count * 6
+    inv_score -= high_count * 3
+    inv_score = max(inv_score, 0)
+    c["Inversion (No Red Flags)"] = {"score": inv_score, "max": 20, "detail": f"Critical: {critical_count}, High: {high_count}"}
+    s += inv_score
+
+    # 4. Patience & moat durability (15 pts)
+    patience = 0
+    if latest_roe_v and latest_roe_v > 15: patience += 4
+    if latest_roce_v and latest_roce_v > 15: patience += 4
+    if latest_de_v is not None and latest_de_v < 0.5: patience += 4
+    if promoter_info and promoter_info > 50: patience += 3
+    patience = min(patience, 15)
+    c["Moat Durability (Patience)"] = {"score": patience, "max": 15, "detail": "Wide moat + low debt = hold forever quality"}
+    s += patience
+
+    # 5. Rationality check — debt & dilution (10 pts)
+    rational = 10
+    if latest_de_v is not None and latest_de_v > 1.0: rational -= 4
+    if latest_de_v is not None and latest_de_v > 2.0: rational -= 3
+    if not debt_reduced and latest_de_v and latest_de_v > 0.5: rational -= 2
+    rational = max(rational, 0)
+    c["Capital Allocation Rationality"] = {"score": rational, "max": 10, "detail": f"Debt trend: {'Reducing' if debt_reduced else 'Increasing'}"}
+    s += rational
+
+    s = _clip(s)
+    fw["score"] = round(s, 1)
+    fw["components"] = c
+    fw["verdict"] = _fw_verdict(s)
+    return fw
+
+
+def fisher_score(pl, bs, key, latest_opm_v, latest_roe_v, latest_roce_v, latest_de_v, rev_cagr_v, pro_cagr_v, consistent_growth, cfo_positive, debt_reduced, promoter_info, inst_holding, industry, mcap):
+    """Phil Fisher — Scuttlebutt method. Invest in companies with high innovation,
+    strong R&D, excellent management, and long-term growth horizons."""
+    fw = _framework_base("Fisher (Scuttlebutt)",
+        '"The stock market is filled with individuals who know the price of everything, but the value of nothing."')
+    c = {}
+    s = 0
+
+    # 1. Innovation & R&D potential (20 pts)
+    innovation = 0
+    if industry:
+        ind_lower = industry.lower()
+        innovative_kw = ["software", "pharma", "ai", "semiconductor", "renewable", "defense", "digital", "fintech", "electronics", "healthcare", "biotech", "technology"]
+        for kw in innovative_kw:
+            if kw in ind_lower:
+                innovation += 15
+                break
+    if rev_cagr_v and rev_cagr_v > 15: innovation += 5
+    elif rev_cagr_v and rev_cagr_v > 10: innovation += 3
+    innovation = min(innovation, 20)
+    c["Innovation & R&D Potential"] = {"score": innovation, "max": 20, "detail": f"Industry: {industry}" if industry else "N/A"}
+    s += innovation
+
+    # 2. Margin quality & cost efficiency (25 pts)
+    margin_score = 0
+    if latest_opm_v:
+        if latest_opm_v > 25: margin_score = 25
+        elif latest_opm_v > 20: margin_score = 21
+        elif latest_opm_v > 15: margin_score = 16
+        elif latest_opm_v > 10: margin_score = 10
+        else: margin_score = 5
+    c["Profit Margins & Cost Efficiency"] = {"score": margin_score, "max": 25, "detail": f"OPM: {latest_opm_v}%"}
+    s += margin_score
+
+    # 3. Management quality (25 pts)
+    mgmt_score = 0
+    if promoter_info:
+        if promoter_info > 70: mgmt_score += 10
+        elif promoter_info > 50: mgmt_score += 8
+        elif promoter_info > 30: mgmt_score += 5
+        else: mgmt_score += 2
+    if debt_reduced: mgmt_score += 5
+    if latest_de_v is not None and latest_de_v < 0.5: mgmt_score += 5
+    if latest_roe_v and latest_roe_v > 18: mgmt_score += 5
+    elif latest_roe_v and latest_roe_v > 12: mgmt_score += 3
+    mgmt_score = min(mgmt_score, 25)
+    c["Management & Leadership"] = {"score": mgmt_score, "max": 25, "detail": f"Promoter: {promoter_info}%, Debt reduced: {debt_reduced}"}
+    s += mgmt_score
+
+    # 4. Sales organization & growth (15 pts)
+    sales_score = 0
+    if consistent_growth: sales_score += 5
+    if rev_cagr_v and rev_cagr_v > 15: sales_score += 5
+    elif rev_cagr_v and rev_cagr_v > 10: sales_score += 3
+    if pro_cagr_v and pro_cagr_v > 15: sales_score += 5
+    elif pro_cagr_v and pro_cagr_v > 10: sales_score += 3
+    sales_score = min(sales_score, 15)
+    c["Sales & Growth Organization"] = {"score": sales_score, "max": 15, "detail": f"Rev CAGR: {rev_cagr_v}%, Profit CAGR: {pro_cagr_v}%"}
+    s += sales_score
+
+    # 5. Long-term horizon (15 pts)
+    lt_score = 0
+    if mcap and mcap > 5000: lt_score += 4
+    if latest_roe_v and latest_roe_v > 15: lt_score += 4
+    if latest_de_v is not None and latest_de_v < 0.5: lt_score += 4
+    if cfo_positive: lt_score += 3
+    lt_score = min(lt_score, 15)
+    c["Long-Term Horizon"] = {"score": lt_score, "max": 15, "detail": f"Market cap: {mcap}Cr" if mcap else "N/A"}
+    s += lt_score
+
+    s = _clip(s)
+    fw["score"] = round(s, 1)
+    fw["components"] = c
+    fw["verdict"] = _fw_verdict(s)
+    return fw
+
+
+def canslim_score(pl, bs, key, latest_eps_v, latest_pe_v, latest_roe_v, latest_opm_v, rev_cagr_v, pro_cagr_v, eps_ser, sales, profit, latest_price_v, shares_units, promoter_info, inst_holding, mcap, industry, consistent_growth, revenue_accel_status):
+    """William O'Neil — CAN SLIM. Momentum + fundamentals.
+    C: Current earnings, A: Annual earnings, N: New, S: Supply, L: Leader, I: Institutional, M: Market."""
+    fw = _framework_base("CAN SLIM (O'Neil)",
+        '"To make money in stocks you must have a clear plan and follow it carefully."')
+    c = {}
+    s = 0
+
+    # C — Current quarterly earnings (20 pts)
+    c_score = 0
+    if eps_ser and len(eps_ser) >= 2:
+        eps_vals = list(eps_ser.values())
+        if len(eps_vals) >= 2 and eps_vals[-1] and eps_vals[-2]:
+            eps_growth = (eps_vals[-1] - eps_vals[-2]) / abs(eps_vals[-2]) * 100
+            if eps_growth > 50: c_score = 20
+            elif eps_growth > 25: c_score = 17
+            elif eps_growth > 10: c_score = 12
+            elif eps_growth > 0: c_score = 7
+            else: c_score = 2
+    if pro_cagr_v:
+        if pro_cagr_v > 25: c_score = max(c_score, 16)
+        elif pro_cagr_v > 15: c_score = max(c_score, 12)
+    c["C: Current Earnings"] = {"score": c_score, "max": 20, "detail": f"Profit CAGR: {pro_cagr_v}%" if pro_cagr_v else "N/A"}
+    s += c_score
+
+    # A — Annual earnings growth (15 pts)
+    a_score = 0
+    if rev_cagr_v:
+        if rev_cagr_v > 25: a_score = 15
+        elif rev_cagr_v > 15: a_score = 12
+        elif rev_cagr_v > 10: a_score = 8
+        elif rev_cagr_v > 5: a_score = 5
+        else: a_score = 2
+    if consistent_growth: a_score = min(a_score + 3, 15)
+    c["A: Annual Earnings"] = {"score": a_score, "max": 15, "detail": f"Rev CAGR: {rev_cagr_v}%" if rev_cagr_v else "N/A"}
+    s += a_score
+
+    # N — New product/management/high (15 pts)
+    n_score = 0
+    if revenue_accel_status == "Accelerating": n_score += 6
+    if industry:
+        ind_lower = industry.lower()
+        new_kw = ["software", "ai", "fintech", "semiconductor", "renewable", "ev", "defense", "pharma", "digital", "cloud"]
+        for kw in new_kw:
+            if kw in ind_lower:
+                n_score += 5
+                break
+    if latest_roe_v and latest_roe_v > 20: n_score += 4
+    n_score = min(n_score, 15)
+    c["N: New (Products/Highs)"] = {"score": n_score, "max": 15, "detail": f"Revenue: {revenue_accel_status}"}
+    s += n_score
+
+    # S — Supply and demand (15 pts)
+    s_score = 0
+    if shares_units:
+        if shares_units < 1e7: s_score += 6
+        elif shares_units < 5e7: s_score += 4
+        else: s_score += 2
+    if promoter_info and promoter_info > 60: s_score += 5
+    if mcap and mcap > 5000: s_score += 4
+    s_score = min(s_score, 15)
+    c["S: Supply & Demand"] = {"score": s_score, "max": 15, "detail": f"Shares: {shares_units}" if shares_units else "N/A"}
+    s += s_score
+
+    # L — Leader or laggard (15 pts)
+    l_score = 0
+    if latest_opm_v:
+        if latest_opm_v > 25: l_score += 5
+        elif latest_opm_v > 15: l_score += 3
+    if latest_roe_v:
+        if latest_roe_v > 25: l_score += 5
+        elif latest_roe_v > 15: l_score += 3
+    if mcap and mcap > 20000: l_score += 5
+    elif mcap and mcap > 5000: l_score += 3
+    l_score = min(l_score, 15)
+    c["L: Leader or Laggard"] = {"score": l_score, "max": 15, "detail": f"Margins: {latest_opm_v}%, Mcap: {mcap}Cr" if mcap else "N/A"}
+    s += l_score
+
+    # I — Institutional sponsorship (10 pts)
+    i_score = 0
+    if inst_holding is not None:
+        if inst_holding > 30: i_score = 10
+        elif inst_holding > 15: i_score = 7
+        elif inst_holding > 5: i_score = 4
+        else: i_score = 2
+    c["I: Institutional Sponsorship"] = {"score": i_score, "max": 10, "detail": f"Institutional: {inst_holding}%" if inst_holding is not None else "N/A"}
+    s += i_score
+
+    # M — Market direction (10 pts) — proxy with consistency
+    m_score = 0
+    if consistent_growth: m_score += 5
+    if rev_cagr_v and rev_cagr_v > 10: m_score += 5
+    elif rev_cagr_v and rev_cagr_v > 5: m_score += 3
+    m_score = min(m_score, 10)
+    c["M: Market Direction (Proxy)"] = {"score": m_score, "max": 10, "detail": "Based on growth consistency as market proxy"}
+    s += m_score
+
+    s = _clip(s)
+    fw["score"] = round(s, 1)
+    fw["components"] = c
+    fw["verdict"] = _fw_verdict(s)
+    return fw
+
+
+def overall_investor_score(framework_results):
+    """Aggregate all 5 frameworks into one Overall Investment Score (0-100)."""
+    names = [f["framework"] for f in framework_results]
+    scores = [f["score"] for f in framework_results]
+    avg = sum(scores) / len(scores) if scores else 0
+    # Weighted: Buffett & Lynch higher weight for value investors
+    weighted = 0
+    weights = {"Buffett (Buffettology)": 0.25, "Lynch (GARP)": 0.20, "Munger (Mental Models)": 0.20, "Fisher (Scuttlebutt)": 0.15, "CAN SLIM (O'Neil)": 0.20}
+    total_w = 0
+    for fw in framework_results:
+        w = weights.get(fw["framework"], 0.2)
+        weighted += fw["score"] * w
+        total_w += w
+    weighted_score = weighted / total_w if total_w > 0 else avg
+
+    if weighted_score >= 80: overall_verdict = "STRONG BUY — Exceptional across all frameworks"
+    elif weighted_score >= 60: overall_verdict = "BUY — Good alignment with multiple strategies"
+    elif weighted_score >= 40: overall_verdict = "HOLD — Mixed signals across frameworks"
+    elif weighted_score >= 20: overall_verdict = "CAUTION — Most frameworks disagree"
+    else: overall_verdict = "AVOID — Consistently poor across all frameworks"
+
+    return {
+        "overall_score": round(weighted_score, 1),
+        "simple_avg": round(avg, 1),
+        "verdict": overall_verdict,
+        "frameworks_included": len(framework_results),
+    }
 
 
 def overall_signal(scores, overall_score, val_info, risks, piotroski, promoter_holding):
@@ -2175,65 +2602,685 @@ def analyze_full(company_name, slug, sheets, biz_info):
         biz_info.get("institutional_holding"), biz_info.get("promoter_holding")
     )
 
+    # ═════════════════════════════════════════════════════════════════════
+    # INVESTOR FRAMEWORK SCORING (Buffett, Lynch, Munger, Fisher, CAN SLIM)
+    # ═════════════════════════════════════════════════════════════════════
+    fw_buffett  = buffett_score(pl_section, bs_section, cf_section, key_section,
+                    latest_roe_v, latest_roce_v, latest_opm_v, latest_de_v,
+                    latest_int_cov, cfo_positive, rev_cagr_v, pro_cagr_v,
+                    consistent_growth, debt_reduced, biz_info.get("industry"))
+    fw_lynch    = lynch_score(pl_section, bs_section, key_section,
+                    latest_pe_v, latest_eps_v, latest_de_v, latest_roe_v,
+                    latest_opm_v, rev_cagr_v, pro_cagr_v, consistent_growth,
+                    cfo_positive, promoter_info, biz_info.get("institutional_holding"))
+    fw_munger   = munger_score(latest_roe_v, latest_roce_v, latest_opm_v,
+                    latest_de_v, latest_int_cov, rev_cagr_v, pro_cagr_v,
+                    consistent_growth, debt_reduced, cfo_positive,
+                    piotroski, altman.get("zone", ""), biz_info.get("industry"),
+                    result.get("red_flags", {}).get("red_flags", []),
+                    promoter_info)
+    fw_fisher   = fisher_score(pl_section, bs_section, key_section,
+                    latest_opm_v, latest_roe_v, latest_roce_v, latest_de_v,
+                    rev_cagr_v, pro_cagr_v, consistent_growth, cfo_positive,
+                    debt_reduced, promoter_info, biz_info.get("institutional_holding"),
+                    biz_info.get("industry"), mcap)
+    fw_canslim  = canslim_score(pl_section, bs_section, key_section,
+                    latest_eps_v, latest_pe_v, latest_roe_v, latest_opm_v,
+                    rev_cagr_v, pro_cagr_v, eps_ser, sales, profit,
+                    latest_price_v, shares_units, promoter_info,
+                    biz_info.get("institutional_holding"), mcap,
+                    biz_info.get("industry"), consistent_growth,
+                    rev_acc.get("status", "Insufficient data"))
+
+    framework_results = [fw_buffett, fw_lynch, fw_munger, fw_fisher, fw_canslim]
+    fw_overall = overall_investor_score(framework_results)
+
+    result["investor_frameworks"] = {
+        "frameworks": framework_results,
+        "overall": fw_overall,
+    }
+
     return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AUTH ROUTES
+# US STOCK MARKET ANALYSIS (via Yahoo Finance)
 # ══════════════════════════════════════════════════════════════════════════════
 
-@app.route("/landing")
-def landing():
-    return render_template("landing.html")
+US_SECTORS = {
+    "Technology": ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "AVGO", "ORCL", "CRM", "ADBE", "INTC", "AMD", "CSCO", "IBM", "QCOM"],
+    "Healthcare": ["JNJ", "UNH", "PFE", "ABBV", "MRK", "TMO", "ABT", "MDT", "BMY", "LLY", "AMGN", "ISRG", "SYK", "BSX", "GILD"],
+    "Financials": ["JPM", "BAC", "WFC", "C", "GS", "MS", "V", "MA", "AXP", "BLK", "SCHW", "USB", "PNC", "BK", "COF"],
+    "Consumer Cyclical": ["TSLA", "AMZN", "HD", "MCD", "NKE", "SBUX", "LOW", "TGT", "GM", "F", "LULU", "TJX", "ROST", "MAR", "BKNG"],
+    "Energy": ["XOM", "CVX", "COP", "EOG", "SLB", "OXY", "PSX", "VLO", "MPC", "HAL", "BKR", "HES", "DVN", "FANG", "CTRA"],
+    "Communication Services": ["GOOGL", "META", "NFLX", "DIS", "CMCSA", "T", "VZ", "EA", "TTWO", "WBD", "PARA", "LYV", "MTCH", "ROKU", "SNAP"],
+    "Industrials": ["CAT", "DE", "GE", "HON", "UPS", "BA", "LMT", "RTX", "MMM", "UNP", "CSX", "EMR", "ETN", "ITW", "GD"],
+    "Utilities": ["NEE", "DUK", "SO", "D", "AEP", "EXC", "SRE", "PEG", "ED", "XEL", "WEC", "ES", "AWK", "EIX", "DTE"],
+    "Real Estate": ["PLD", "AMT", "CCI", "EQIX", "PSA", "O", "DLR", "SPG", "WY", "AVB", "EQR", "WELL", "ARE", "BXP", "VICI"],
+    "Basic Materials": ["LIN", "SHW", "APD", "ECL", "FCX", "NEM", "DOW", "DD", "PPG", "NUE", "STLD", "ALB", "MOS", "CF", "EMN"],
+    "Biotechnology": ["AMGN", "GILD", "REGN", "VRTX", "BIIB", "ILMN", "MRNA", "ALXN", "INCY", "UTHR", "EXEL", "NBIX", "ALNY", "SRPT", "BGNE"],
+    "Consumer Defensive": ["PG", "KO", "PEP", "WMT", "COST", "CL", "KMB", "MDLZ", "KHC", "GIS", "CPB", "SJM", "CAG", "HRL", "K"],
+}
 
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if request.method == "POST":
-        email = request.form.get("email", "").strip().lower()
-        password = request.form.get("password", "")
-        users = load_users()
-        if email in users and check_password_hash(users[email]["password"], password):
-            session.permanent = True
-            session["user"] = {"email": email, "name": users[email]["name"]}
-            return jsonify({"ok": True})
-        return jsonify({"error": "Invalid email or password"}), 401
-    return render_template("login.html")
+# ── US stock autocomplete cache ──
+_us_search_cache = {}
+_us_search_cache_time = 0
 
-@app.route("/register", methods=["GET", "POST"])
-def register():
-    if request.method == "POST":
-        name = request.form.get("name", "").strip()
-        email = request.form.get("email", "").strip().lower()
-        password = request.form.get("password", "")
-        if not name or not email or not password:
-            return jsonify({"error": "All fields are required"}), 400
-        if len(password) < 6:
-            return jsonify({"error": "Password must be at least 6 characters"}), 400
-        users = load_users()
-        if email in users:
-            return jsonify({"error": "Email already registered"}), 409
-        users[email] = {"name": name, "password": generate_password_hash(password)}
-        save_users(users)
-        return jsonify({"ok": True})
-    return render_template("register.html")
+def _us_label(ticker, info=None):
+    """Build display label for a US stock."""
+    if info is None:
+        try:
+            import yfinance as yf
+            info = yf.Ticker(ticker).info or {}
+        except:
+            info = {}
+    name = info.get("longName") or info.get("shortName") or ticker
+    sector = info.get("sector", "")
+    industry = info.get("industry", "")
+    price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
+    price_str = f"${price:.2f}" if price else ""
+    return {"ticker": ticker, "name": name, "sector": sector, "industry": industry, "price": price_str}
 
-@app.route("/logout")
-def logout():
-    session.pop("user", None)
-    return redirect(url_for("landing"))
+
+def us_search(q):
+    """Search US stocks by ticker or name."""
+    import yfinance as yf
+    q = q.strip().upper()
+    results = []
+    # Search by ticker exact
+    try:
+        tk = yf.Ticker(q)
+        info = tk.info or {}
+        if info.get("longName") or info.get("shortName"):
+            results.append(_us_label(q, info))
+    except:
+        pass
+    # Search by name in sector lists
+    for sector, tickers in US_SECTORS.items():
+        for t in tickers:
+            if q in t or (len(q) >= 2 and t.startswith(q)):
+                if not any(r["ticker"] == t for r in results):
+                    try:
+                        tk = yf.Ticker(t)
+                        results.append(_us_label(t, tk.info or {}))
+                    except:
+                        results.append({"ticker": t, "name": t, "sector": sector, "industry": "", "price": ""})
+                    if len(results) >= 6:
+                        break
+        if len(results) >= 6:
+            break
+    return results[:6]
+
+
+def _yh_metric(fin_df, keywords):
+    """Find a row in yfinance DataFrame by keyword matching."""
+    if fin_df is None or fin_df.empty:
+        return {}
+    for idx in fin_df.index:
+        idx_str = str(idx).lower()
+        if any(kw.lower() in idx_str for kw in keywords):
+            series = fin_df.loc[idx]
+            return {str(col.year): round(float(val), 2) if val is not None and pd.notna(val) else None for col, val in zip(series.index, series.values)}
+    return {}
+
+
+def fetch_us_financials(ticker):
+    """Fetch US stock data from Yahoo Finance, return in sections format compatible with scoring engines."""
+    import yfinance as yf
+    tk = yf.Ticker(ticker)
+    info = tk.info or {}
+
+    def _to_num(v):
+        try:
+            if isinstance(v, complex): return round(v.real, 2)
+            if isinstance(v, (int, float)): return round(float(v), 2)
+            return round(float(v), 2)
+        except: return None
+
+    def collect(fin_df):
+        """Convert yfinance DataFrame to {metric: {year: val}}."""
+        d = {}
+        if fin_df is None or fin_df.empty:
+            return d
+        for idx in fin_df.index:
+            series = fin_df.loc[idx]
+            yr_vals = {}
+            for col, val in zip(series.index, series.values):
+                if val is not None and pd.notna(val):
+                    yr = str(col.year) if hasattr(col, 'year') else str(col)
+                    num = _to_num(val)
+                    if num is not None:
+                        yr_vals[yr] = num
+            if yr_vals:
+                d[str(idx)] = yr_vals
+        return d
+
+    pl_raw = collect(tk.financials)
+    bs_raw = collect(tk.balance_sheet)
+    cf_raw = collect(tk.cashflow)
+
+    # Build sections dict
+    pl_section = {"data": {}, "years": []}
+    bs_section = {"data": {}, "years": []}
+    cf_section = {"data": {}, "years": []}
+    key_section = {"data": {}, "years": []}
+
+    # Map yfinance financials to our metric names
+    rev_map = {"Total Revenue": "Sales", "Revenue": "Sales", "Operating Revenue": "Sales"}
+    for yf_key, our_key in rev_map.items():
+        if yf_key in pl_raw:
+            pl_section["data"][our_key] = pl_raw[yf_key]
+            break
+    if "Sales" not in pl_section["data"]:
+        # Try keyword match
+        for k, v in pl_raw.items():
+            kl = k.lower()
+            if any(w in kl for w in ["total revenue", "revenue", "sales", "operating revenue"]):
+                pl_section["data"]["Sales"] = v
+                break
+
+    np_map = {"Net Income": "Net profit", "Net Income From Continuing Operation Net Minority Interest": "Net profit"}
+    for yf_key, our_key in np_map.items():
+        if yf_key in pl_raw:
+            pl_section["data"][our_key] = pl_raw[yf_key]
+            break
+    if "Net profit" not in pl_section["data"]:
+        for k, v in pl_raw.items():
+            kl = k.lower()
+            if any(w in kl for w in ["net income", "net profit", "net earnings"]):
+                if "discontinued" not in kl and "comprehensive" not in kl:
+                    pl_section["data"]["Net profit"] = v
+                    break
+
+    for yf_key, our_key in [("EBITDA", "EBITDA"), ("EBIT", "Operating Profit")]:
+        if yf_key in pl_raw:
+            pl_section["data"][our_key] = pl_raw[yf_key]
+    if "Operating Profit" not in pl_section["data"]:
+        for k, v in pl_raw.items():
+            kl = k.lower()
+            if any(w in kl for w in ["operating income", "ebit"]):
+                pl_section["data"]["Operating Profit"] = v
+                break
+
+    if "Interest Expense" in pl_raw:
+        pl_section["data"]["Interest"] = {k: abs(v) if v else 0 for k, v in pl_raw["Interest Expense"].items()}
+    if "Depreciation And Amortization" in pl_raw:
+        pl_section["data"]["Depreciation"] = {k: abs(v) if v else 0 for k, v in pl_raw["Depreciation And Amortization"].items()}
+
+    # Balance sheet
+    for yf_key, our_key in [("Total Debt", "Borrowings"), ("Stockholders Equity", "Reserves"),
+                              ("Total Equity Gross Minority Interest", "Equity"),
+                              ("Cash And Cash Equivalents", "Cash"),
+                              ("Cash And Cash Equivalents, Reported", "Cash"),
+                              ("Current Assets", "Current Assets"),
+                              ("Current Liabilities", "Current Liabilities"),
+                              ("Inventory", "Inventory"),
+                              ("Accounts Receivable", "Receivables"),
+                              ("Total Assets", "Total Assets")]:
+        if yf_key in bs_raw:
+            bs_section["data"][our_key] = bs_raw[yf_key]
+    # Try keyword fallback for key BS items
+    if "Borrowings" not in bs_section["data"]:
+        for k, v in bs_raw.items():
+            kl = k.lower()
+            if any(w in kl for w in ["total debt", "borrowings"]):
+                bs_section["data"]["Borrowings"] = v
+                break
+    if "Cash" not in bs_section["data"]:
+        for k, v in bs_raw.items():
+            kl = k.lower()
+            if any(w in kl for w in ["cash and cash equivalents", "cash", "cash equivalents"]):
+                if "restricted" not in kl:
+                    bs_section["data"]["Cash"] = v
+                    break
+    if "Reserves" not in bs_section["data"]:
+        for k, v in bs_raw.items():
+            kl = k.lower()
+            if any(w in kl for w in ["stockholders equity", "total equity", "shareholders equity"]):
+                bs_section["data"]["Reserves"] = v
+                break
+    if "No. of Equity Shares" not in bs_section["data"]:
+        shares = info.get("sharesOutstanding")
+        if shares:
+            bs_section["data"]["No. of Equity Shares"] = {"Latest": float(shares)}
+
+    # Cash flow items
+    for yf_key, our_key in [("Free Cash Flow", "Free Cash Flow"),
+                              ("Capital Expenditure", "Capex"),
+                              ("Operating Cash Flow", "Cash from Operating Activity")]:
+        if yf_key in cf_raw:
+            cf_section["data"][our_key] = {k: abs(v) if v else 0 for k, v in cf_raw[yf_key].items()}
+    if "Cash from Operating Activity" not in cf_section["data"]:
+        cfo = info.get("operatingCashflow")
+        if cfo:
+            cf_section["data"]["Cash from Operating Activity"] = {"Latest": float(cfo)}
+    if "Capex" not in cf_section["data"]:
+        for k, v in cf_raw.items():
+            kl = k.lower()
+            if any(w in kl for w in ["capital expenditure", "capex"]):
+                cf_section["data"]["Capex"] = {k2: abs(v2) if v2 else 0 for k2, v2 in v.items()}
+                break
+
+    # Key ratios from info dict
+    cur_price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
+    if cur_price:
+        key_section["data"]["Price"] = {"Latest": float(cur_price)}
+    if info.get("trailingEps"):
+        key_section["data"]["EPS"] = {"Latest": float(info["trailingEps"])}
+    if info.get("bookValue") and info["bookValue"] > 0:
+        key_section["data"]["BVPS"] = {"Latest": float(info["bookValue"])}
+    if info.get("trailingPE"):
+        key_section["data"]["P/E"] = {"Latest": float(info["trailingPE"])}
+    if info.get("returnOnEquity") is not None:
+        key_section["data"]["ROE"] = {"Latest": round(float(info["returnOnEquity"]) * 100, 1)}
+    if info.get("priceToBook") and info["priceToBook"] > 0:
+        key_section["data"]["P/B"] = {"Latest": float(info["priceToBook"])}
+    if info.get("debtToEquity") is not None:
+        key_section["data"]["Debt/Equity"] = {"Latest": round(float(info["debtToEquity"]) / 100, 2)}
+    if info.get("currentRatio"):
+        key_section["data"]["Current Ratio"] = {"Latest": float(info["currentRatio"])}
+    if info.get("profitMargins") is not None:
+        key_section["data"]["Net Margin"] = {"Latest": round(float(info["profitMargins"]) * 100, 1)}
+    if info.get("operatingMargins") is not None:
+        key_section["data"]["OPM"] = {"Latest": round(float(info["operatingMargins"]) * 100, 1)}
+    if info.get("freeCashflow"):
+        key_section["data"]["Free Cash Flow"] = {"Latest": float(info["freeCashflow"])}
+    if info.get("revenueGrowth") is not None:
+        key_section["data"]["Revenue Growth"] = {"Latest": round(float(info["revenueGrowth"]) * 100, 1)}
+
+    # Build all_years from sales data
+    sales_data = pl_section["data"].get("Sales", {})
+    pl_years = sorted(sales_data.keys(), key=lambda y: (len(y), y)) if sales_data else []
+    bs_years = sorted(bs_section["data"].get("Borrowings", {}).keys(), key=lambda y: (len(y), y)) if bs_section["data"].get("Borrowings") else pl_years
+
+    pl_section["years"] = pl_years
+    bs_section["years"] = bs_years
+    key_section["years"] = ["Latest"]
+
+    return {
+        "Profit & Loss": pl_section,
+        "Balance Sheet": bs_section,
+        "Cash Flow": cf_section,
+        "Key": key_section,
+        "_info": info,
+        "_ticker": ticker,
+    }
+
+
+def analyze_us_stock(ticker):
+    """Full analysis of a US stock using the same investor frameworks."""
+    import yfinance as yf
+    sections = fetch_us_financials(ticker)
+    info = sections.get("_info", {})
+
+    # Extract data for analysis functions
+    pl = sections.get("Profit & Loss", {}).get("data", {})
+    bs = sections.get("Balance Sheet", {}).get("data", {})
+    cf = sections.get("Cash Flow", {}).get("data", {})
+    key = sections.get("Key", {}).get("data", {})
+
+    def lv(d): return list(d.values())[-1] if d else None
+    def fv(d): return list(d.values())[0] if d else None
+    def yrs(d): return max(len(d) - 1, 1) if d else 1
+
+    sales_d = pl.get("Sales", {})
+    profit_d = pl.get("Net profit", {})
+    ebitda_d = pl.get("EBITDA", {})
+    op_d = pl.get("Operating Profit", {})
+    int_d = pl.get("Interest", {})
+    dep_d = pl.get("Depreciation", {})
+    borrowings_d = bs.get("Borrowings", {})
+    reserves_d = bs.get("Reserves", {})
+    cash_d = bs.get("Cash", {})
+    shares_d = bs.get("No. of Equity Shares", {})
+    cfo_d = cf.get("Cash from Operating Activity", {})
+    fcf_d = cf.get("Free Cash Flow", {})
+
+    rev_cagr_v = cagr(fv(sales_d), lv(sales_d), yrs(sales_d)) if sales_d else None
+    pro_cagr_v = cagr(fv(profit_d), lv(profit_d), yrs(profit_d)) if profit_d else None
+    eps_cagr_v = cagr(fv(key.get("EPS", {})), lv(key.get("EPS", {})), yrs(key.get("EPS", {}))) if key.get("EPS") else None
+
+    latest_price_v = lv(key.get("Price", {}))
+    latest_eps_v = lv(key.get("EPS", {}))
+    latest_bvps_v = lv(key.get("BVPS", {}))
+    latest_pe_v = lv(key.get("P/E", {}))
+    latest_roe_v = lv(key.get("ROE", {}))
+    latest_de_v = lv(key.get("Debt/Equity", {}))
+    latest_opm_v = lv(key.get("OPM", {}))
+    latest_nm_v = lv(key.get("Net Margin", {}))
+    latest_int_cov = None
+    if op_d and int_d:
+        op_l = lv(op_d)
+        int_l = lv(int_d)
+        if op_l and int_l and int_l > 0:
+            latest_int_cov = round(op_l / int_l, 1)
+    latest_roce_v = None
+    if op_d and borrowings_d and reserves_d:
+        op_l = lv(op_d)
+        debt_l = lv(borrowings_d) or 0
+        eq_l = lv(reserves_d) or 0
+        ce = eq_l + debt_l
+        if op_l and ce > 0:
+            latest_roce_v = round((op_l / ce) * 100, 1)
+
+    debt_reduced = False
+    if borrowings_d and len(borrowings_d) >= 2:
+        vals = list(borrowings_d.values())
+        debt_reduced = vals[-1] < vals[-2]
+    cfo_val = lv(cfo_d) or info.get("operatingCashflow")
+    cfo_positive = (cfo_val or 0) > 0
+
+    # Growth consistency
+    sales_vals = list(sales_d.values())
+    profit_vals = list(profit_d.values())
+    sales_growth_years = []
+    for i in range(1, len(sales_vals)):
+        if sales_vals[i-1] and sales_vals[i-1] > 0:
+            sales_growth_years.append((sales_vals[i] - sales_vals[i-1]) / sales_vals[i-1] * 100)
+    profit_growth_years = []
+    for i in range(1, len(profit_vals)):
+        if profit_vals[i-1] and profit_vals[i-1] > 0:
+            profit_growth_years.append((profit_vals[i] - profit_vals[i-1]) / profit_vals[i-1] * 100)
+    consistent_growth = (len(sales_growth_years) >= 3 and
+                         sum(1 for g in sales_growth_years if g > 0) >= 2 and
+                         sum(1 for g in profit_growth_years if g > 0) >= 2)
+
+    mcap = info.get("marketCap")
+    mcap_cr = round(mcap / 1e7, 2) if mcap else None  # approximate for score_val
+    promoter_info = None
+    inst_holding = info.get("heldPercentInstitutions")
+    if inst_holding is not None:
+        inst_holding = round(inst_holding * 100, 1)
+
+    # Scores
+    scores = {}
+    scores["Revenue Growth"] = score_cagr(rev_cagr_v)
+    scores["Profit Growth"] = score_cagr(pro_cagr_v)
+    scores["Oper. Margin"] = score_val(latest_opm_v, [(25,10),(20,9),(15,8),(10,6)])
+    scores["ROE"] = score_val(latest_roe_v, [(25,10),(15,8),(10,6)])
+    scores["ROCE"] = score_val(latest_roce_v, [(20,10),(15,8),(10,6)])
+    scores["Debt Mgmt"] = (9 if debt_reduced else 8 if (latest_de_v or 99) < 0.5
+                           else 6 if (latest_de_v or 99) < 1.0 else 4)
+    scores["Cash Flow"] = 8 if cfo_positive else 5
+    scores["EPS Growth"] = score_cagr(eps_cagr_v) if eps_cagr_v else 5
+    overall = round(sum(scores.values()) / len(scores), 1)
+
+    if overall >= 8.5: verdict, v_cls = "STRONG BUY", "strong-buy"
+    elif overall >= 7.5: verdict, v_cls = "BUY", "buy"
+    elif overall >= 6.5: verdict, v_cls = "ACCUMULATE", "watch"
+    elif overall >= 5.5: verdict, v_cls = "HOLD", "hold"
+    else: verdict, v_cls = "AVOID", "avoid"
+
+    company_name = info.get("longName") or info.get("shortName") or ticker
+    sector = info.get("sector", "N/A")
+    industry = info.get("industry", "N/A")
+
+    # Valuation using info-based metrics
+    val = None
+    if latest_price_v and latest_eps_v and latest_eps_v > 0:
+        val = valuation_engine(
+            eps=latest_eps_v, bvps=latest_bvps_v,
+            current_price=latest_price_v,
+            rev_cagr=rev_cagr_v, pro_cagr=pro_cagr_v,
+            ebitda_val=lv(ebitda_d),
+            total_debt=lv(borrowings_d), cash=lv(cash_d),
+            shares_outstanding=info.get("sharesOutstanding"),
+        )
+
+    # Business info
+    biz_info = {
+        "industry": industry,
+        "sector": sector,
+        "description": info.get("longBusinessSummary", "")[:200],
+        "market_cap": mcap_cr,
+        "promoter_holding": None,
+        "institutional_holding": inst_holding,
+    }
+
+    risks = []
+    if latest_de_v and latest_de_v > 1.0: risks.append("High Debt-to-Equity ratio")
+    if not cfo_positive: risks.append("Negative operating cash flow")
+    if rev_cagr_v is None or (rev_cagr_v < 5): risks.append("Slow or negative revenue growth")
+    if latest_int_cov and latest_int_cov < 2: risks.append("Low interest coverage")
+
+    # Piotroski
+    piotroski, piotroski_details = piotroski_f_score(pl, bs, cf, key)
+
+    # Altman
+    altman = altman_z_score(pl, bs, key, latest_price_v, info.get("sharesOutstanding"))
+
+    # Earnings quality
+    eq = earnings_quality_analysis(cfo_d, profit_d)
+
+    # Revenue acceleration
+    rev_acc = revenue_acceleration(sales_d)
+
+    # Entry zones
+    zones = entry_zones(latest_price_v, val)
+
+    # Magic Formula
+    mf = magic_formula_rank(key, pl, bs, latest_price_v, info.get("sharesOutstanding"))
+
+    # Investor Frameworks
+    fw_buffett = buffett_score(pl, bs, cf, key,
+                    latest_roe_v, latest_roce_v, latest_opm_v, latest_de_v,
+                    latest_int_cov, cfo_positive, rev_cagr_v, pro_cagr_v,
+                    consistent_growth, debt_reduced, industry)
+    fw_lynch = lynch_score(pl, bs, key,
+                    latest_pe_v, latest_eps_v, latest_de_v, latest_roe_v,
+                    latest_opm_v, rev_cagr_v, pro_cagr_v, consistent_growth,
+                    cfo_positive, promoter_info, inst_holding)
+    fw_munger = munger_score(latest_roe_v, latest_roce_v, latest_opm_v,
+                    latest_de_v, latest_int_cov, rev_cagr_v, pro_cagr_v,
+                    consistent_growth, debt_reduced, cfo_positive,
+                    piotroski, altman.get("zone", ""), industry,
+                    [], promoter_info)
+    fw_fisher = fisher_score(pl, bs, key,
+                    latest_opm_v, latest_roe_v, latest_roce_v, latest_de_v,
+                    rev_cagr_v, pro_cagr_v, consistent_growth, cfo_positive,
+                    debt_reduced, promoter_info, inst_holding, industry, mcap_cr)
+    fw_canslim = canslim_score(pl, bs, key,
+                    latest_eps_v, latest_pe_v, latest_roe_v, latest_opm_v,
+                    rev_cagr_v, pro_cagr_v, key.get("EPS", {}), sales_d, profit_d,
+                    latest_price_v, info.get("sharesOutstanding"), promoter_info,
+                    inst_holding, mcap_cr, industry, consistent_growth,
+                    rev_acc.get("status", "Insufficient data"))
+
+    framework_results = [fw_buffett, fw_lynch, fw_munger, fw_fisher, fw_canslim]
+    fw_overall = overall_investor_score(framework_results)
+
+    result = {
+        "company_name": company_name,
+        "ticker": ticker,
+        "market": "US",
+        "generated_at": datetime.now().strftime("%d %b %Y %H:%M"),
+        "business": biz_info,
+        "metrics": {
+            "rev_cagr": round(rev_cagr_v, 1) if rev_cagr_v else None,
+            "pro_cagr": round(pro_cagr_v, 1) if pro_cagr_v else None,
+            "latest_opm": round(latest_opm_v, 1) if latest_opm_v else None,
+            "latest_roe": round(latest_roe_v, 1) if latest_roe_v else None,
+            "latest_roce": round(latest_roce_v, 1) if latest_roce_v else None,
+            "latest_pe": round(latest_pe_v, 1) if latest_pe_v else None,
+            "latest_de": round(latest_de_v, 2) if latest_de_v else None,
+            "latest_eps": round(latest_eps_v, 2) if latest_eps_v else None,
+            "latest_bvps": round(latest_bvps_v, 2) if latest_bvps_v else None,
+            "latest_price": round(latest_price_v, 2) if latest_price_v else None,
+            "debt_reduced": debt_reduced,
+            "cfo_positive": cfo_positive,
+            "interest_coverage": round(latest_int_cov, 1) if latest_int_cov else None,
+            "net_margin": round(latest_nm_v, 1) if latest_nm_v else None,
+        },
+        "series": {
+            "sales": series_list(sales_d, 8),
+            "profit": series_list(profit_d, 8),
+            "ebitda": series_list(ebitda_d, 8),
+            "borrowings": series_list(borrowings_d, 8),
+            "reserves": series_list(reserves_d, 8),
+            "cfo": series_list(cfo_d, 8),
+        },
+        "val": val,
+        "risks": risks,
+        "scores": scores,
+        "overall": overall,
+        "verdict": verdict,
+        "v_cls": v_cls,
+        "piotroski_fscore": {"score": piotroski, "max_score": 9, "details": piotroski_details,
+                             "rating": "Strong" if piotroski >= 7 else "Moderate" if piotroski >= 5 else "Weak"},
+        "earnings_quality": eq,
+        "revenue_acceleration": rev_acc,
+        "altman_z": altman,
+        "entry_zones": zones,
+        "magic_formula": mf,
+        "overall_signal": overall_signal(scores, overall, val, risks, piotroski, promoter_info),
+        "industry_future": assess_industry_future(industry),
+        "economic_sensitivity": assess_economic_sensitivity(industry, latest_de_v, latest_int_cov),
+        "institutional_assessment": assess_institutional_buying(inst_holding, promoter_info),
+        "investor_frameworks": {"frameworks": framework_results, "overall": fw_overall},
+    }
+    return result
+
+
+def us_sector_analysis(sector_name):
+    """Analyze all tickers in a sector and return ranked results."""
+    sector_key = None
+    for key in US_SECTORS:
+        if key.lower() == sector_name.lower():
+            sector_key = key
+            break
+    if not sector_key:
+        return {"error": f"Sector '{sector_name}' not found. Available: {', '.join(US_SECTORS.keys())}"}
+
+    tickers = US_SECTORS[sector_key]
+    results = []
+    errors = []
+    for ticker in tickers:
+        try:
+            data = analyze_us_stock(ticker)
+            results.append({
+                "ticker": ticker,
+                "name": data["company_name"],
+                "overall_score": data.get("investor_frameworks", {}).get("overall", {}).get("overall_score", data["overall"]),
+                "verdict": data["verdict"],
+                "overall_fundamentals": data["overall"],
+                "frameworks": data.get("investor_frameworks", {}).get("frameworks", []),
+                "metrics": {
+                    "pe": data["metrics"]["latest_pe"],
+                    "roe": data["metrics"]["latest_roe"],
+                    "rev_cagr": data["metrics"]["rev_cagr"],
+                    "pro_cagr": data["metrics"]["pro_cagr"],
+                    "de": data["metrics"]["latest_de"],
+                    "price": data["metrics"]["latest_price"],
+                }
+            })
+        except Exception as e:
+            errors.append({"ticker": ticker, "error": str(e)})
+
+    results.sort(key=lambda r: r["overall_score"], reverse=True)
+    return {
+        "sector": sector_key,
+        "total_stocks": len(tickers),
+        "analyzed": len(results),
+        "errors": errors,
+        "ranked_stocks": results,
+    }
+
+
+# ── SECTOR ANALYSIS CACHE ────────────────────────────────────────────────────
+SECTOR_CACHE = {}
+SECTOR_CACHE_TTL = timedelta(minutes=30)
+
+def get_cached_sector_analysis(sector_name):
+    now = datetime.now()
+    key = sector_name.lower()
+    if key in SECTOR_CACHE:
+        entry = SECTOR_CACHE[key]
+        if now - entry["ts"] < SECTOR_CACHE_TTL:
+            return entry["data"]
+    data = us_sector_analysis(sector_name)
+    SECTOR_CACHE[key] = {"ts": now, "data": data}
+    return data
+
+def find_sector_for_ticker(ticker):
+    """Find which predefined US sector a ticker belongs to."""
+    t = ticker.upper()
+    for sector, tickers in US_SECTORS.items():
+        if t in tickers:
+            return sector
+    return None
+
+def compute_sector_context(ticker, framework_results, overall_fundamentals_score):
+    """Compute peer ranking & comparison data within the stock's sector."""
+    sector = find_sector_for_ticker(ticker)
+    if not sector:
+        return None
+
+    sector_data = get_cached_sector_analysis(sector)
+    if "error" in sector_data:
+        return None
+
+    ranked = sector_data.get("ranked_stocks", [])
+    total = sector_data.get("total_stocks", 0)
+    analyzed = sector_data.get("analyzed", 0)
+
+    my_rank = next((i + 1 for i, s in enumerate(ranked) if s["ticker"].upper() == ticker.upper()), None)
+
+    # Sector averages for framework scores
+    sector_avg_scores = {}
+    if ranked:
+        fw_keys = ["Buffett (Buffettology)", "Lynch (GARP)", "Munger (Mental Models)",
+                    "Fisher (Scuttlebutt)", "CAN SLIM (O'Neil)"]
+        for fk in fw_keys:
+            scores = []
+            for s in ranked:
+                for fw in s.get("frameworks", []):
+                    if fw["framework"] == fk and fw["score"] is not None:
+                        scores.append(fw["score"])
+            sector_avg_scores[fk] = round(sum(scores) / len(scores), 1) if scores else None
+
+    # Stock's own framework scores for comparison
+    my_fw_scores = {}
+    for fw in framework_results or []:
+        my_fw_scores[fw["framework"]] = fw["score"]
+
+    # Compute percentiles
+    percentiles = {}
+    for fk in my_fw_scores:
+        scores = []
+        for s in ranked:
+            for fw in s.get("frameworks", []):
+                if fw["framework"] == fk and fw["score"] is not None:
+                    scores.append(fw["score"])
+        my_score = my_fw_scores[fk]
+        if scores and my_score is not None:
+            below = sum(1 for x in scores if x < my_score)
+            pct = round(below / len(scores) * 100) if scores else 50
+            percentiles[fk] = pct
+
+    return {
+        "sector": sector,
+        "total_stocks": total,
+        "analyzed_stocks": analyzed,
+        "rank": my_rank,
+        "percentile": round((1 - (my_rank or 1) / max(total, 1)) * 100) if my_rank else None,
+        "sector_averages": sector_avg_scores,
+        "my_scores": my_fw_scores,
+        "percentiles": percentiles,
+        "overall_sector_leader": ranked[0]["ticker"] if ranked else None,
+        "overall_sector_leader_score": ranked[0]["overall_score"] if ranked else None,
+    }
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ROUTES
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.route("/")
-@login_required
 def index():
-    return render_template("index.html", user=session.get("user"))
+    return render_template("index.html")
 
 
 @app.route("/api/search")
-@login_required
 def search():
     q = request.args.get("q", "").strip()
     if not q:
@@ -2248,7 +3295,6 @@ def search():
 
 
 @app.route("/api/analyze")
-@login_required
 def analyze_route():
     slug = request.args.get("slug", "").strip()
     name = request.args.get("name", slug)
@@ -2304,7 +3350,6 @@ def analyze_route():
 
 
 @app.route("/api/analyze/excel", methods=["POST"])
-@login_required
 def analyze_excel():
     """Analyze from uploaded Screener.in Excel file."""
     try:
@@ -2368,7 +3413,6 @@ def analyze_excel():
 
 
 @app.route("/api/pdf")
-@login_required
 def generate_pdf():
     """Quick PDF download — pass same params as /analyze."""
     slug = request.args.get("slug", "").strip()
@@ -2391,7 +3435,6 @@ def generate_pdf():
 
 
 @app.route("/api/live")
-@login_required
 def live_price():
     slug = request.args.get("slug", "").strip()
     name = request.args.get("name", slug)
@@ -2404,6 +3447,62 @@ def live_price():
         resp = jsonify({"error": "Live price not available", "price": None})
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# US STOCK ROUTES
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/us/search")
+def us_search_route():
+    q = request.args.get("q", "").strip()
+    if not q or len(q) < 1:
+        return jsonify([])
+    try:
+        results = us_search(q)
+        return jsonify(results)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/us/analyze")
+def us_analyze_route():
+    ticker = request.args.get("ticker", "").strip().upper()
+    if not ticker:
+        return jsonify({"error": "No ticker provided"}), 400
+    try:
+        result = analyze_us_stock(ticker)
+        # Inject sector context for peer comparison
+        fw_results = result.get("investor_frameworks", {}).get("frameworks", [])
+        result["sector_context"] = compute_sector_context(
+            ticker, fw_results, result.get("overall")
+        )
+        resp = jsonify(result)
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
+@app.route("/api/us/sector")
+def us_sector_route():
+    sector = request.args.get("sector", "").strip()
+    if not sector:
+        return jsonify({"error": "No sector provided", "available": list(US_SECTORS.keys())}), 400
+    try:
+        result = us_sector_analysis(sector)
+        resp = jsonify(result)
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    except Exception as e:
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+
+
+@app.route("/api/us/sectors")
+def us_sectors_list():
+    return jsonify(list(US_SECTORS.keys()))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2693,6 +3792,35 @@ def build_pdf(A):
             story.append(Paragraph(det_text,
                 ST("sig_d",fontName="Helvetica",fontSize=8.5,textColor=C_MID,alignment=TA_CENTER,leading=12)))
             story.append(Spacer(1,10))
+
+    # ── Investor Framework Scores ──
+    fws = A.get("investor_frameworks", {})
+    if fws and fws.get("frameworks"):
+        story.append(Paragraph("HOW LEGENDARY INVESTORS SCORE THIS STOCK",
+            ST("fw_sec",fontName="Helvetica-Bold",fontSize=12,textColor=C_ACC,spaceAfter=5)))
+        overall = fws.get("overall", {})
+        if overall:
+            ov_color = C_GREEN if overall.get("overall_score", 0) >= 60 else C_AMBER if overall.get("overall_score", 0) >= 40 else C_RED
+            ov_banner = Table([[Paragraph(
+                f"OVERALL INVESTMENT SCORE: {overall.get('overall_score', 'N/A')}/100  —  {overall.get('verdict', '')}",
+                ST("ov_t",fontName="Helvetica-Bold",fontSize=11,textColor=C_WHITE,alignment=TA_CENTER))]],
+                colWidths=[17*cm])
+            ov_banner.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,-1),ov_color),
+                ("TOPPADDING",(0,0),(-1,-1),8),("BOTTOMPADDING",(0,0),(-1,-1),8)]))
+            story.append(ov_banner); story.append(Spacer(1,8))
+        for fw in fws["frameworks"]:
+            sc = fw.get("score", 0)
+            sc_color = C_GREEN if sc >= 60 else C_AMBER if sc >= 40 else C_RED
+            fw_pairs = [("Score", f"{sc}/100")]
+            comps = fw.get("components", {})
+            for k, v in comps.items():
+                fw_pairs.append((f"  {k}", f"{v.get('score',0)}/{v.get('max',0)}"))
+            story.append(Paragraph(f"<b>{fw['framework']}</b> — {fw.get('verdict','')}",
+                ST("fw_n",fontName="Helvetica-Bold",fontSize=10,textColor=sc_color,spaceAfter=2)))
+            story.append(Paragraph(f"<font size='8' color='#8B949E'>{fw.get('tagline','')}</font>",
+                ST("fw_t",fontName="Helvetica",fontSize=8,textColor=C_MID,spaceAfter=4)))
+            story.append(kv_tbl(fw_pairs, (6*cm, 3.5*cm)))
+            story.append(Spacer(1,6))
 
     # Scores
     story.append(Paragraph("SCORE CARD",ST("s6",fontName="Helvetica-Bold",fontSize=12,textColor=C_ACC,spaceAfter=5)))

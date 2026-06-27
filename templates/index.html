@@ -118,6 +118,37 @@
     line-height: 1.6;
   }
 
+  /* ── MARKET TOGGLE ── */
+  .market-tabs {
+    display: flex; gap: 0;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+    margin-bottom: 12px;
+  }
+  .market-tab {
+    flex: 1;
+    padding: 10px 18px;
+    text-align: center;
+    font-family: 'Syne', sans-serif;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all .2s;
+    color: var(--muted);
+    border-right: 1px solid var(--border);
+    letter-spacing: .03em;
+  }
+  .market-tab:last-child { border-right: none; }
+  .market-tab.active {
+    background: var(--acc);
+    color: #fff;
+    box-shadow: 0 2px 12px rgba(79,142,247,0.3);
+  }
+  .market-tab .tab-icon { margin-right: 6px; }
+  .market-tab .tab-sub { font-size: 10px; opacity: 0.7; font-weight: 400; display: block; margin-top: 2px; }
+
   /* ── SEARCH ── */
   .search-wrap {
     position: relative; z-index: 100;
@@ -166,6 +197,30 @@
 
   #searchBtn:hover { background: #3b7de8; }
   #searchBtn:active { transform: scale(0.97); }
+
+  /* ── SECTOR SEARCH ── */
+  #sectorSection { display: none; }
+  .sector-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 10px;
+    margin-top: 12px;
+  }
+  .sector-chip {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+    cursor: pointer;
+    transition: all .2s;
+    text-align: center;
+    font-family: 'Syne', sans-serif;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+  }
+  .sector-chip:hover { border-color: var(--acc); background: rgba(79,142,247,0.06); transform: translateY(-1px); }
+  .sector-chip .chip-icon { font-size: 20px; display: block; margin-bottom: 4px; }
 
   /* ── DROPDOWN ── */
   #dropdown {
@@ -724,6 +779,18 @@
   <p class="subtitle">Deep fundamental analysis with 5-model valuation.<br>Undervalued or overvalued — know before you invest.</p>
 </div>
 
+<!-- MARKET TOGGLE -->
+<div class="search-wrap" style="max-width:580px">
+  <div class="market-tabs">
+    <div class="market-tab active" data-market="india" onclick="switchMarket('india')">
+      <span class="tab-icon">🇮🇳</span> India <span class="tab-sub">NSE/BSE • Screener.in</span>
+    </div>
+    <div class="market-tab" data-market="us" onclick="switchMarket('us')">
+      <span class="tab-icon">🇺🇸</span> US <span class="tab-sub">NYSE/NASDAQ • Yahoo Finance</span>
+    </div>
+  </div>
+</div>
+
 <!-- SEARCH -->
 <div class="search-wrap">
   <div class="search-box">
@@ -733,8 +800,8 @@
   <div id="dropdown"></div>
 </div>
 
-<!-- EXCEL UPLOAD OPTION -->
-<div class="upload-wrap" style="text-align:center;padding:16px 24px 32px;position:relative;z-index:1">
+<!-- EXCEL UPLOAD OPTION (India only) -->
+<div id="indiaUpload" class="upload-wrap" style="text-align:center;padding:16px 24px 32px;position:relative;z-index:1">
   <div style="color:var(--muted);font-size:13px;margin-bottom:12px">— OR —</div>
   <label class="upload-btn" style="display:inline-flex;align-items:center;gap:8px;background:var(--bg3);border:1px dashed var(--border);border-radius:12px;padding:14px 24px;cursor:pointer;transition:all .2s">
     <span style="font-size:20px">📊</span>
@@ -742,7 +809,6 @@
     <input type="file" id="excelUpload" accept=".xlsx,.xls" style="display:none">
   </label>
   <div id="uploadStatus" style="font-size:12px;color:var(--muted);margin-top:8px"></div>
-
   <!-- GUIDE -->
   <div style="max-width:500px;margin:20px auto 0;background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:16px;text-align:left">
     <div style="font-size:12px;color:var(--acc);font-weight:600;margin-bottom:10px">How to download Excel from Screener.in:</div>
@@ -755,6 +821,17 @@
     </ol>
     <div style="font-size:10px;color:var(--muted);margin-top:10px;padding-top:8px;border-top:1px solid var(--border)">
       💡 <strong>Tip:</strong> Use this if live data is slow or session expired. Your uploaded data is processed locally and never stored.
+    </div>
+  </div>
+</div>
+
+<!-- SECTOR ANALYSIS (US only) -->
+<div id="sectorSection" class="search-wrap" style="text-align:center;padding:8px 24px 32px">
+  <div style="color:var(--muted);font-size:13px;margin-bottom:8px">— Or analyze an entire US sector —</div>
+  <div class="sector-grid" id="sectorGrid"></div>
+  <div id="sectorLoading" style="display:none;padding:20px">
+    <div class="spin-ring"></div>
+    <div style="font-size:12px;color:var(--muted);margin-top:8px">Analyzing sector...</div>
     </div>
   </div>
 </div>
@@ -807,6 +884,8 @@
 let selectedSlug = null;
 let selectedName = null;
 let searchTimer  = null;
+let currentMarket = 'india'; // 'india' or 'us'
+let selectedTicker = null;
 
 const input    = document.getElementById('searchInput');
 const dropdown = document.getElementById('dropdown');
@@ -884,9 +963,13 @@ input.addEventListener('input', () => {
   clearTimeout(searchTimer);
   selectedSlug = null;
   selectedName = null;
+  selectedTicker = null;
   const q = input.value.trim();
   if (!q) { showSearchHistory(); return; }
-  searchTimer = setTimeout(() => fetchSuggestions(q), 300);
+  searchTimer = setTimeout(() => {
+    if (currentMarket === 'us') fetchSuggestionsUS(q);
+    else fetchSuggestions(q);
+  }, 300);
 });
 
 input.addEventListener('focus', () => {
@@ -920,6 +1003,17 @@ async function fetchSuggestions(q) {
 
 // ── SEARCH BUTTON ──
 searchBtn.addEventListener('click', () => {
+  if (currentMarket === 'us') {
+    if (selectedTicker) { runAnalysisUS(); return; }
+    const q = input.value.trim().toUpperCase().replace(/.*\(([^)]+)\)/, '$1').trim();
+    if (!q) return;
+    // Direct ticker search
+    selectedTicker = q;
+    selectedSlug = q;
+    selectedName = q;
+    runAnalysisUS();
+    return;
+  }
   if (selectedSlug) { runAnalysis(); return; }
   // try direct slug from input
   const q = input.value.trim();
@@ -957,6 +1051,163 @@ function showSearchHistory() {
   dd.innerHTML = `<div style="padding:6px 14px 2px;font-size:10px;color:var(--muted);letter-spacing:.1em;text-transform:uppercase;border-bottom:1px solid var(--border)">Recent</div>` +
     h.map(s => `<div class="drop-item" data-slug="${s.slug}" data-name="${s.name}"><span class="drop-icon">🕐</span><span class="drop-name">${s.name}</span></div>`).join('');
   dd.style.display = 'block';
+}
+
+// ── MARKET SWITCH ──
+function switchMarket(market) {
+  currentMarket = market;
+  document.querySelectorAll('.market-tab').forEach(t => t.classList.toggle('active', t.dataset.market === market));
+  const isUS = market === 'us';
+  input.placeholder = isUS ? 'Search US stock (e.g. AAPL, MSFT, GOOGL...)' : 'Search company (e.g. Emmvee, Reliance, TCS...)';
+  document.getElementById('indiaUpload').style.display = isUS ? 'none' : 'block';
+  document.getElementById('sectorSection').style.display = isUS ? 'block' : 'none';
+  document.querySelector('.logo-badge').innerHTML = isUS
+    ? '<span class="logo-dot"></span>Powered by Yahoo Finance Data'
+    : '<span class="logo-dot"></span>Powered by Screener.in Data';
+  selectedSlug = null;
+  selectedTicker = null;
+  document.getElementById('results').style.display = 'none';
+  document.getElementById('sectorResults').style.display = 'none';
+  document.getElementById('dropdown').style.display = 'none';
+  input.value = '';
+  clearInterval(liveTimer);
+  if (isUS) loadSectors();
+}
+
+// ── US STOCK SEARCH ──
+async function fetchSuggestionsUS(q) {
+  const res  = await fetch(`/api/us/search?q=${encodeURIComponent(q)}&_=${Date.now()}`);
+  const data = await res.json();
+  if (!data || !data.length) { dropdown.style.display = 'none'; return; }
+  dropdown.innerHTML = data.map(c => `
+    <div class="drop-item" data-ticker="${c.ticker}" data-name="${c.name}" data-sector="${c.sector || ''}">
+      <span class="drop-icon">🇺🇸</span>
+      <div>
+        <div class="drop-name">${c.name} <span style="font-size:10px;color:var(--muted);font-family:'DM Mono',monospace">${c.ticker}</span></div>
+        <div class="drop-url">${c.sector} ${c.price ? '• ' + c.price : ''}</div>
+      </div>
+    </div>`).join('');
+  dropdown.style.display = 'block';
+  dropdown.querySelectorAll('.drop-item').forEach(el => {
+    el.addEventListener('click', () => {
+      selectedTicker = el.dataset.ticker;
+      selectedName = el.dataset.name;
+      selectedSlug = el.dataset.ticker;
+      input.value = `${el.dataset.name} (${el.dataset.ticker})`;
+      dropdown.style.display = 'none';
+      runAnalysisUS();
+    });
+  });
+}
+
+async function runAnalysisUS() {
+  if (!selectedTicker) return;
+  loader.style.display = 'none';
+  skeleton.style.display = 'block';
+  results.style.display = 'none';
+  errorBox.style.display = 'none';
+  dropdown.style.display = 'none';
+  clearInterval(liveTimer);
+
+  try {
+    const res  = await fetch(`/api/us/analyze?ticker=${encodeURIComponent(selectedTicker)}&_=${Date.now()}`);
+    const data = await res.json();
+    if (data.error) throw new Error(data.error);
+    skeleton.style.display = 'none';
+    results.style.display = 'block';
+    renderResults(data);
+  } catch(err) {
+    skeleton.style.display = 'none';
+    errorBox.style.display = 'block';
+    errorBox.textContent = '❌  ' + err.message;
+  }
+}
+
+// ── SECTOR ANALYSIS ──
+async function loadSectors() {
+  const grid = document.getElementById('sectorGrid');
+  try {
+    const res = await fetch('/api/us/sectors');
+    const sectors = await res.json();
+    const icons = ['💻','🏥','🏦','🛒','⛽','📡','🏭','⚡','🏠','🧪','🧬','🥫'];
+    grid.innerHTML = sectors.map((s, i) =>
+      `<div class="sector-chip" onclick="analyzeSector('${s}')"><span class="chip-icon">${icons[i % icons.length]}</span>${s}</div>`
+    ).join('');
+  } catch(e) {
+    grid.innerHTML = '<div style="color:var(--muted);font-size:12px">Failed to load sectors</div>';
+  }
+}
+
+async function analyzeSector(sector) {
+  const loading = document.getElementById('sectorLoading');
+  const resultsDiv = document.getElementById('sectorResults');
+  resultsDiv.style.display = 'none';
+  loading.style.display = 'block';
+  try {
+    const res = await fetch(`/api/us/sector?sector=${encodeURIComponent(sector)}&_=${Date.now()}`);
+    const data = await res.json();
+    loading.style.display = 'none';
+    if (data.error) { resultsDiv.innerHTML = `<div style="color:var(--red)">${data.error}</div>`; resultsDiv.style.display = 'block'; return; }
+    renderSectorResults(data, resultsDiv);
+  } catch(e) {
+    loading.style.display = 'none';
+    resultsDiv.innerHTML = `<div style="color:var(--red)">Error: ${e.message}</div>`;
+    resultsDiv.style.display = 'block';
+  }
+}
+
+function renderSectorResults(data, el) {
+  const s = data.sector;
+  const stocks = data.ranked_stocks || [];
+  let html = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <div style="font-family:'Syne',sans-serif;font-size:20px;font-weight:700;color:var(--text)">${s} Sector</div>
+      <div style="font-size:12px;color:var(--muted)">${stocks.length} stocks ranked</div>
+    </div>
+    <div style="overflow-x:auto">
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <thead>
+        <tr style="background:var(--bg3);border-bottom:1px solid var(--border)">
+          <th style="padding:10px 12px;text-align:left;color:var(--muted);font-weight:600">#</th>
+          <th style="padding:10px 12px;text-align:left;color:var(--muted);font-weight:600">Ticker</th>
+          <th style="padding:10px 12px;text-align:left;color:var(--muted);font-weight:600">Name</th>
+          <th style="padding:10px 12px;text-align:center;color:var(--muted);font-weight:600">Score</th>
+          <th style="padding:10px 12px;text-align:center;color:var(--muted);font-weight:600">Verdict</th>
+          <th style="padding:10px 12px;text-align:right;color:var(--muted);font-weight:600">P/E</th>
+          <th style="padding:10px 12px;text-align:right;color:var(--muted);font-weight:600">ROE</th>
+          <th style="padding:10px 12px;text-align:right;color:var(--muted);font-weight:600">Price</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${stocks.map((st, i) => {
+          const scoreColor = st.overall_score >= 60 ? 'var(--green)' : st.overall_score >= 40 ? 'var(--amber)' : 'var(--red)';
+          const vColor = st.verdict === 'STRONG BUY' || st.verdict === 'BUY' ? 'var(--green)' : st.verdict === 'AVOID' ? 'var(--red)' : 'var(--amber)';
+          return `<tr style="border-bottom:1px solid var(--border);cursor:pointer" onclick="analyzeUSTicker('${st.ticker}')">
+            <td style="padding:10px 12px;color:var(--muted)">${i+1}</td>
+            <td style="padding:10px 12px;font-family:'DM Mono',monospace;color:var(--acc);font-weight:600">${st.ticker}</td>
+            <td style="padding:10px 12px;color:var(--text)">${st.name}</td>
+            <td style="padding:10px 12px;text-align:center;font-family:'Syne',sans-serif;font-weight:800;color:${scoreColor}">${st.overall_score}</td>
+            <td style="padding:10px 12px;text-align:center;color:${vColor};font-weight:600;font-size:11px">${st.verdict}</td>
+            <td style="padding:10px 12px;text-align:right;color:var(--text)">${st.metrics.pe !== null ? st.metrics.pe : '—'}</td>
+            <td style="padding:10px 12px;text-align:right;color:var(--text)">${st.metrics.roe !== null ? st.metrics.roe + '%' : '—'}</td>
+            <td style="padding:10px 12px;text-align:right;color:var(--text)">${st.metrics.price !== null ? '$' + st.metrics.price : '—'}</td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table></div>
+    ${data.errors && data.errors.length > 0 ? `<div style="margin-top:12px;font-size:11px;color:var(--muted)">${data.errors.length} stock(s) failed to analyze</div>` : ''}
+  `;
+  el.innerHTML = html;
+  el.style.display = 'block';
+}
+
+async function analyzeUSTicker(ticker) {
+  selectedTicker = ticker;
+  selectedSlug = ticker;
+  selectedName = ticker;
+  document.getElementById('sectorResults').style.display = 'none';
+  document.getElementById('results').scrollIntoView({ behavior: 'smooth' });
+  await runAnalysisUS();
 }
 
 async function runAnalysis() {
@@ -1707,6 +1958,96 @@ function renderResults(A) {
         </div>
       </div>
     </div>` : '<div class="card fade-in" style="color:var(--muted)">Insufficient data for buy confirmation</div>'}
+
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+    <!-- NEW: INVESTOR FRAMEWORK SCORING (Buffett, Lynch, Munger, Fisher, CAN SLIM) -->
+    <!-- ════════════════════════════════════════════════════════════════════ -->
+    ${A.investor_frameworks ? `
+    <div class="section-label fade-in">🧠 How Legendary Investors Would Score This Stock</div>
+    <div class="card fade-in" style="border:2px solid rgba(79,142,247,0.2);background:rgba(79,142,247,0.03);padding:24px;text-align:center">
+      <div style="font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">Overall Investment Score</div>
+      <div style="font-family:'Syne',sans-serif;font-size:52px;font-weight:800;color:${A.investor_frameworks.overall.overall_score >= 60 ? 'var(--green)' : A.investor_frameworks.overall.overall_score >= 40 ? 'var(--amber)' : 'var(--red)'};line-height:1">${A.investor_frameworks.overall.overall_score}</div>
+      <div style="font-size:13px;color:var(--muted);margin:4px 0 10px">out of 100 &middot; Weighted across ${A.investor_frameworks.overall.frameworks_included} frameworks</div>
+      <div style="display:inline-block;padding:8px 24px;border-radius:8px;font-size:15px;font-weight:700;font-family:'Syne',sans-serif;background:${A.investor_frameworks.overall.overall_score >= 60 ? 'rgba(34,197,94,0.1)' : A.investor_frameworks.overall.overall_score >= 40 ? 'rgba(245,158,11,0.1)' : 'rgba(239,68,68,0.1)'};color:${A.investor_frameworks.overall.overall_score >= 60 ? 'var(--green)' : A.investor_frameworks.overall.overall_score >= 40 ? 'var(--amber)' : 'var(--red)'}">${A.investor_frameworks.overall.verdict}</div>
+    </div>
+    ${A.sector_context ? `
+    <div class="card fade-in" style="border:1px solid rgba(79,142,247,0.15);background:rgba(79,142,247,0.02);padding:18px;margin-top:14px">
+      <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px">
+        <div>
+          <span style="font-family:'Syne',sans-serif;font-size:15px;font-weight:700;color:var(--text)">${A.sector_context.sector} Sector</span>
+          <span style="font-size:11px;color:var(--muted);margin-left:8px">Peer Comparison &middot; ${A.sector_context.analyzed_stocks}/${A.sector_context.total_stocks} stocks</span>
+        </div>
+        <div style="text-align:right">
+          <div style="font-family:'Syne',sans-serif;font-size:24px;font-weight:800;color:${A.sector_context.rank && A.sector_context.rank <= 3 ? 'var(--green)' : A.sector_context.rank && A.sector_context.rank <= 8 ? 'var(--amber)' : 'var(--red)'}">#${A.sector_context.rank || '?'}</div>
+          <div style="font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em">of ${A.sector_context.total_stocks} &middot; Top ${A.sector_context.percentile}%</div>
+        </div>
+      </div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:10px;font-weight:600">Sector Leader: ${A.sector_context.overall_sector_leader} (${A.sector_context.overall_sector_leader_score})</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px">
+        ${Object.entries(A.investor_frameworks.overall.overall_score !== undefined ? A.investor_frameworks.overall : {}).length ? Object.entries(A.sector_context.my_scores || {}).map(([fwName, mySc]) => {
+          const avgSc = (A.sector_context.sector_averages || {})[fwName];
+          const pct = (A.sector_context.percentiles || {})[fwName];
+          const diff = mySc != null && avgSc != null ? mySc - avgSc : null;
+          const diffSymbol = diff > 0 ? '▲' : diff < 0 ? '▼' : '─';
+          const diffColor = diff > 0 ? 'var(--green)' : diff < 0 ? 'var(--red)' : 'var(--muted)';
+          const shortName = fwName.replace(/\s*\(.*?\)\s*$/, '');
+          return `
+          <div style="padding:8px 10px;border-radius:8px;background:var(--bg3)">
+            <div style="font-size:10px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.04em">${shortName}</div>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-top:2px">
+              <span style="font-size:18px;font-weight:700;font-family:'Syne',sans-serif;color:${mySc >= 60 ? 'var(--green)' : mySc >= 40 ? 'var(--amber)' : 'var(--red)'}">${mySc}</span>
+              <span style="font-size:11px;color:${diffColor};font-weight:600">${diff != null ? diffSymbol + Math.abs(diff).toFixed(1) : '─'}</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;font-size:9px;color:var(--muted);margin-top:1px">
+              <span>Sector Avg: ${avgSc != null ? avgSc : '─'}</span>
+              <span>p${pct != null ? pct : '─'}</span>
+            </div>
+          </div>`;
+        }).join('') : ''}
+      </div>
+    </div>` : ''}
+    <div class="fade-in" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;margin-top:16px">
+      ${A.investor_frameworks.frameworks.map(fw => {
+        const sc = fw.score;
+        const scColor = sc >= 60 ? 'var(--green)' : sc >= 40 ? 'var(--amber)' : 'var(--red)';
+        const scBg = sc >= 60 ? 'rgba(34,197,94,0.06)' : sc >= 40 ? 'rgba(245,158,11,0.06)' : 'rgba(239,68,68,0.06)';
+        const fwAvg = A.sector_context && A.sector_context.sector_averages ? A.sector_context.sector_averages[fw.framework] : null;
+        const fwPct = A.sector_context && A.sector_context.percentiles ? A.sector_context.percentiles[fw.framework] : null;
+        return `
+        <div class="card fade-in" style="border:1px solid var(--border);padding:18px">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
+            <div>
+              <div style="font-family:'Syne',sans-serif;font-size:16px;font-weight:700;color:var(--text)">${fw.framework}</div>
+              <div style="font-size:11px;color:var(--muted);line-height:1.4;margin-top:4px">${fw.tagline}</div>
+            </div>
+            <div style="text-align:right">
+              <div style="font-family:'Syne',sans-serif;font-size:36px;font-weight:800;color:${scColor};line-height:1">${sc}</div>
+              <div style="font-size:11px;color:var(--muted)">/ 100</div>
+            </div>
+          </div>
+          <div style="font-size:12px;font-weight:600;padding:4px 12px;border-radius:20px;display:inline-block;background:${scBg};color:${scColor};margin-bottom:12px">${fw.verdict}</div>
+          ${fwAvg != null ? `
+          <div style="display:flex;justify-content:space-between;align-items:center;font-size:10px;color:var(--muted);padding:6px 8px;border-radius:6px;background:var(--bg3);margin-bottom:10px">
+            <span>Sector Avg: <strong style="color:var(--text)">${fwAvg}</strong></span>
+            <span>p${fwPct != null ? fwPct : '─'} &middot; ${A.sector_context ? A.sector_context.sector : ''}</span>
+          </div>` : ''}
+          <div style="margin-top:8px">
+            ${Object.entries(fw.components).map(([key, val]) => `
+              <div style="margin-bottom:6px">
+                <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:2px">
+                  <span style="color:var(--text)">${key}</span>
+                  <span style="color:${val.score >= val.max * 0.6 ? 'var(--green)' : val.score >= val.max * 0.3 ? 'var(--amber)' : 'var(--red)'}">${val.score}/${val.max}</span>
+                </div>
+                <div style="height:5px;background:var(--bg3);border-radius:4px;overflow:hidden">
+                  <div style="height:100%;width:${val.max > 0 ? (val.score / val.max * 100) : 0}%;background:${val.score >= val.max * 0.6 ? 'var(--green)' : val.score >= val.max * 0.3 ? 'var(--amber)' : 'var(--red)'};border-radius:4px;transition:width .5s"></div>
+                </div>
+                <div style="font-size:10px;color:var(--muted);margin-top:1px">${val.detail}</div>
+              </div>
+            `).join('')}
+          </div>
+        </div>`;
+      }).join('')}
+    </div>` : ''}
 
     <!-- ════════════════════════════════════════════════════════════════════ -->
     <!-- NEW: INDUSTRY, MANAGEMENT & ECONOMIC ASSESSMENT -->
