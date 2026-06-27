@@ -446,6 +446,24 @@ def _merge_meta_into_biz(sheets, biz_info):
     return biz_info
 
 
+def _enrich_with_yahoo(slug, biz_info):
+    """Enrich biz_info and return (biz_info, yahoo_data) with Yahoo Finance data."""
+    yf_data = scrape_yahoo(slug)
+    if not yf_data:
+        return biz_info, {}
+    if not biz_info.get("industry") and yf_data.get("industry"):
+        biz_info["industry"] = yf_data["industry"]
+    if not biz_info.get("sector") and yf_data.get("sector"):
+        biz_info["sector"] = yf_data["sector"]
+    if not biz_info.get("market_cap") and yf_data.get("market_cap_yf"):
+        biz_info["market_cap"] = yf_data["market_cap_yf"]
+    if not biz_info.get("promoter_holding") and yf_data.get("held_by_insiders"):
+        biz_info["promoter_holding"] = yf_data["held_by_insiders"]
+    if not biz_info.get("institutional_holding") and yf_data.get("held_by_institutions"):
+        biz_info["institutional_holding"] = yf_data["held_by_institutions"]
+    return biz_info, yf_data
+
+
 def scrape_html(slug):
     """Scrape financial data directly from the Screener.in HTML page (no login needed).
     Returns the same sheets dict that parse_excel produces."""
@@ -2207,6 +2225,75 @@ def scrape_business_info(slug):
         log.warning("scrape_business_info failed for %s: %s", slug, e)
     return info
 
+
+def scrape_yahoo(slug):
+    """Fetch supplementary data from Yahoo Finance for Indian stocks (.NS suffix).
+    Returns dict with enriched metrics: industry, sector, shareholding, 52wk, beta, analyst target, etc."""
+    result = {}
+    try:
+        import yfinance as yf
+        ticker_obj = yf.Ticker(f"{slug.upper()}.NS")
+        info = ticker_obj.info or {}
+        if not info or info.get("trailingPegRatio") is None and info.get("shortName") is None:
+            return result
+
+        # Industry & sector (more reliable than Screener)
+        result["industry"] = info.get("industry")
+        result["sector"] = info.get("sector")
+        result["country"] = info.get("country", "India")
+
+        # Market data
+        result["current_price_yf"] = info.get("currentPrice") or info.get("regularMarketPrice")
+        result["market_cap_yf"] = round(info["marketCap"] / 1e7, 2) if info.get("marketCap") else None
+        result["fifty_two_week_high"] = info.get("fiftyTwoWeekHigh")
+        result["fifty_two_week_low"] = info.get("fiftyTwoWeekLow")
+        result["fifty_day_avg"] = info.get("fiftyDayAverage")
+        result["two_hundred_day_avg"] = info.get("twoHundredDayAverage")
+        result["beta"] = info.get("beta")
+
+        # Ratios
+        result["trailing_pe"] = info.get("trailingPE")
+        result["forward_pe"] = info.get("forwardPE")
+        result["price_to_book"] = info.get("priceToBook")
+        result["price_to_sales"] = info.get("priceToSalesTrailing12Months")
+        result["trailing_eps"] = info.get("trailingEps")
+        result["forward_eps"] = info.get("forwardEps")
+        result["book_value_yf"] = info.get("bookValue")
+        result["dividend_yield"] = info.get("dividendYield")
+
+        # Profitability
+        result["roe_yf"] = round(info["returnOnEquity"] * 100, 1) if info.get("returnOnEquity") else None
+        result["operating_margin_yf"] = round(info["operatingMargins"] * 100, 1) if info.get("operatingMargins") else None
+        result["profit_margin_yf"] = round(info["profitMargins"] * 100, 1) if info.get("profitMargins") else None
+
+        # Growth
+        result["revenue_growth"] = round(info["revenueGrowth"] * 100, 1) if info.get("revenueGrowth") else None
+        result["earnings_growth"] = round(info["earningsGrowth"] * 100, 1) if info.get("earningsGrowth") else None
+
+        # Financial health
+        result["debt_to_equity_yf"] = info.get("debtToEquity")
+        result["total_cash"] = round(info["totalCash"] / 1e7, 2) if info.get("totalCash") else None
+        result["total_debt_yf"] = round(info["totalDebt"] / 1e7, 2) if info.get("totalDebt") else None
+        result["free_cashflow_yf"] = round(info["freeCashflow"] / 1e7, 2) if info.get("freeCashflow") else None
+
+        # Shareholding
+        result["held_by_insiders"] = round(info["heldPercentInsiders"] * 100, 1) if info.get("heldPercentInsiders") else None
+        result["held_by_institutions"] = round(info["heldPercentInstitutions"] * 100, 1) if info.get("heldPercentInstitutions") else None
+        result["shares_outstanding"] = info.get("sharesOutstanding")
+
+        # Analyst
+        result["analyst_target"] = info.get("targetMeanPrice")
+        result["analyst_recommendation"] = info.get("recommendationKey")
+
+        # Enterprise value
+        result["enterprise_value"] = round(info["enterpriseValue"] / 1e7, 2) if info.get("enterpriseValue") else None
+
+    except ImportError:
+        log.warning("yfinance not installed — skipping Yahoo enrichment")
+    except Exception as e:
+        log.warning("scrape_yahoo failed for %s: %s", slug, e)
+    return result
+
 # ══════════════════════════════════════════════════════════════════════════════
 # VALUATION ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2336,7 +2423,7 @@ def series_list(s, n=12):
     ks = list(s.keys())[-n:]
     return [{"year": k, "value": s[k]} for k in ks]
 
-def analyze_full(company_name, slug, sheets, biz_info):
+def analyze_full(company_name, slug, sheets, biz_info, yahoo_data=None):
     """Comprehensive analysis returning all sections including 10 advanced features."""
     # ── Extract all raw metrics ──
     _, sales      = get_metric(sheets, ["profit","loss","p&l","income"], ["sales","revenue","net sales"])
@@ -2371,6 +2458,11 @@ def analyze_full(company_name, slug, sheets, biz_info):
     # ── Latest values ──
     rev_cagr_v     = cagr(fv(sales), lv(sales), yrs(sales)) if sales else None
     pro_cagr_v     = cagr(fv(profit), lv(profit), yrs(profit)) if profit else None
+    # Fallback: if first profit was negative, find first positive year for CAGR
+    if pro_cagr_v is None and profit:
+        pos_vals = {k: v for k, v in profit.items() if v and v > 0}
+        if len(pos_vals) >= 2:
+            pro_cagr_v = cagr(list(pos_vals.values())[0], list(pos_vals.values())[-1], len(pos_vals) - 1)
     latest_opm_v   = lv(opm_ser) or (lv(ebitda)/lv(sales)*100 if ebitda and sales and lv(sales) else None)
     latest_roe_v   = lv(roe_ser)
     latest_roce_v  = lv(roce_ser)
@@ -2427,6 +2519,30 @@ def analyze_full(company_name, slug, sheets, biz_info):
     meta_current_price = meta.get("Current Price")
     if meta_current_price is not None:
         latest_price_v = meta_current_price
+
+    # ── Yahoo Finance fallback: fill any remaining None values ──
+    if yahoo_data:
+        if latest_price_v is None and yahoo_data.get("current_price_yf"):
+            latest_price_v = yahoo_data["current_price_yf"]
+        if latest_pe_v is None and yahoo_data.get("trailing_pe"):
+            latest_pe_v = yahoo_data["trailing_pe"]
+        if latest_eps_v is None and yahoo_data.get("trailing_eps"):
+            latest_eps_v = yahoo_data["trailing_eps"]
+        if latest_bvps_v is None and yahoo_data.get("book_value_yf"):
+            latest_bvps_v = yahoo_data["book_value_yf"]
+        if latest_roe_v is None and yahoo_data.get("roe_yf"):
+            latest_roe_v = yahoo_data["roe_yf"]
+        if latest_de_v is None and yahoo_data.get("debt_to_equity_yf"):
+            latest_de_v = round(yahoo_data["debt_to_equity_yf"] / 100, 2)
+        if latest_nm_v is None and yahoo_data.get("profit_margin_yf"):
+            latest_nm_v = yahoo_data["profit_margin_yf"]
+        if latest_em_v is None and yahoo_data.get("operating_margin_yf"):
+            latest_em_v = yahoo_data["operating_margin_yf"]
+        if latest_int_cov is None and opm_ser and int_d:
+            op_l = lv(opm_ser)
+            int_l = lv(int_d)
+            if op_l and int_l and int_l > 0:
+                latest_int_cov = round(op_l / int_l, 1)
 
     # ── Trend analysis ──
     debt_reduced = False
@@ -2687,6 +2803,7 @@ def analyze_full(company_name, slug, sheets, biz_info):
         "company_name": company_name,
         "generated_at": datetime.now().strftime("%d %b %Y %H:%M"),
         "slug": slug,
+        "market": "India",
 
         "business": {
             "industry": biz_info.get("industry", "N/A"),
@@ -2713,15 +2830,25 @@ def analyze_full(company_name, slug, sheets, biz_info):
             "interest_coverage": round(latest_int_cov, 1) if latest_int_cov else None,
             "net_margin": round(latest_nm_v, 1) if latest_nm_v else None,
             "ebitda_margin": round(latest_em_v, 1) if latest_em_v else None,
+            # Yahoo Finance enriched fields
+            "forward_pe": yahoo_data.get("forward_pe") if yahoo_data else None,
+            "forward_eps": yahoo_data.get("forward_eps") if yahoo_data else None,
+            "beta": yahoo_data.get("beta") if yahoo_data else None,
+            "fifty_two_week_high": yahoo_data.get("fifty_two_week_high") if yahoo_data else None,
+            "fifty_two_week_low": yahoo_data.get("fifty_two_week_low") if yahoo_data else None,
+            "fifty_day_avg": yahoo_data.get("fifty_day_avg") if yahoo_data else None,
+            "two_hundred_day_avg": yahoo_data.get("two_hundred_day_avg") if yahoo_data else None,
+            "analyst_target": yahoo_data.get("analyst_target") if yahoo_data else None,
+            "revenue_growth_yf": yahoo_data.get("revenue_growth") if yahoo_data else None,
         },
 
         "series": {
-            "sales":      series_list(q_sales if q_sales else sales, 12),
-            "profit":     series_list(q_profit if q_profit else profit, 12),
-            "ebitda":     series_list(q_ebitda if q_ebitda else ebitda, 12),
-            "borrowings": series_list(q_borrowings if q_borrowings else borrowings, 12),
-            "reserves":   series_list(q_reserves if q_reserves else reserves, 12),
-            "cfo":        series_list(q_cfo if q_cfo else cfo, 12),
+            "sales":      series_list(sales, 12),
+            "profit":     series_list(profit, 12),
+            "ebitda":     series_list(ebitda, 12),
+            "borrowings": series_list(borrowings, 12),
+            "reserves":   series_list(reserves, 12),
+            "cfo":        series_list(cfo, 12),
         },
 
         "ratios": {
@@ -3339,7 +3466,7 @@ def analyze_us_stock(ticker):
     result = {
         "company_name": company_name,
         "ticker": ticker,
-        "market": "US",
+        "market": "India",
         "generated_at": datetime.now().strftime("%d %b %Y %H:%M"),
         "business": biz_info,
         "metrics": {
@@ -3357,6 +3484,17 @@ def analyze_us_stock(ticker):
             "cfo_positive": cfo_positive,
             "interest_coverage": round(latest_int_cov, 1) if latest_int_cov else None,
             "net_margin": round(latest_nm_v, 1) if latest_nm_v else None,
+            "ebitda_margin": round(latest_em_v, 1) if latest_em_v else None,
+            # Yahoo Finance enriched fields
+            "forward_pe": yahoo_data.get("forward_pe") if yahoo_data else None,
+            "forward_eps": yahoo_data.get("forward_eps") if yahoo_data else None,
+            "beta": yahoo_data.get("beta") if yahoo_data else None,
+            "fifty_two_week_high": yahoo_data.get("fifty_two_week_high") if yahoo_data else None,
+            "fifty_two_week_low": yahoo_data.get("fifty_two_week_low") if yahoo_data else None,
+            "fifty_day_avg": yahoo_data.get("fifty_day_avg") if yahoo_data else None,
+            "two_hundred_day_avg": yahoo_data.get("two_hundred_day_avg") if yahoo_data else None,
+            "analyst_target": yahoo_data.get("analyst_target") if yahoo_data else None,
+            "revenue_growth_yf": yahoo_data.get("revenue_growth") if yahoo_data else None,
         },
         "series": {
             "sales": series_list(sales_d, 8),
@@ -3587,8 +3725,8 @@ def analyze_route():
                 resp.headers["Cache-Control"] = "no-store"
                 return resp, 400
             compute_ratios(sheets)
-            biz_info = _merge_meta_into_biz(sheets, scrape_business_info(slug))
-            result = analyze_full(name, slug, sheets, biz_info)
+            biz_info, yahoo_data = _enrich_with_yahoo(slug, _merge_meta_into_biz(sheets, scrape_business_info(slug)))
+            result = analyze_full(name, slug, sheets, biz_info, yahoo_data)
             _ANALYZE_CACHE[slug] = (now, result)
             resp = jsonify(result)
             resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
@@ -3628,12 +3766,12 @@ def analyze_route():
                 resp.headers["Cache-Control"] = "no-store"
                 return resp, 401
             compute_ratios(sheets)
-            biz_info = _merge_meta_into_biz(sheets, scrape_business_info(slug))
-            result = analyze_full(name, slug, sheets, biz_info)
+            biz_info, yahoo_data = _enrich_with_yahoo(slug, _merge_meta_into_biz(sheets, scrape_business_info(slug)))
+            result = analyze_full(name, slug, sheets, biz_info, yahoo_data)
         else:
             sheets = parse_excel(BytesIO(r3.content))
-            biz_info = scrape_business_info(slug)
-            result = analyze_full(name, slug, sheets, biz_info)
+            biz_info, yahoo_data = _enrich_with_yahoo(slug, scrape_business_info(slug))
+            result = analyze_full(name, slug, sheets, biz_info, yahoo_data)
 
         # Store in cache
         _ANALYZE_CACHE[slug] = (now, result)
@@ -3763,8 +3901,8 @@ def generate_pdf():
                 if not sheets or "Profit & Loss" not in sheets:
                     return jsonify({"error": "Could not fetch data from Screener.in."}), 400
                 compute_ratios(sheets)
-                biz_info = _merge_meta_into_biz(sheets, scrape_business_info(slug))
-                data = analyze_full(name, slug, sheets, biz_info)
+                biz_info, yahoo_data = _enrich_with_yahoo(slug, _merge_meta_into_biz(sheets, scrape_business_info(slug)))
+                data = analyze_full(name, slug, sheets, biz_info, yahoo_data)
             else:
                 export_url = BASE + match.group(1)
                 r2 = req.get(export_url, headers=HEADERS, cookies=COOKIES, timeout=(5, 15))
@@ -3789,12 +3927,12 @@ def generate_pdf():
                     if not sheets or "Profit & Loss" not in sheets:
                         return jsonify({"error": "Could not fetch data from Screener.in."}), 401
                     compute_ratios(sheets)
-                    biz_info = _merge_meta_into_biz(sheets, scrape_business_info(slug))
-                    data = analyze_full(name, slug, sheets, biz_info)
+                    biz_info, yahoo_data = _enrich_with_yahoo(slug, _merge_meta_into_biz(sheets, scrape_business_info(slug)))
+                    data = analyze_full(name, slug, sheets, biz_info, yahoo_data)
                 else:
                     sheets = parse_excel(BytesIO(r3.content))
-                    biz_info = _merge_meta_into_biz(sheets, scrape_business_info(slug))
-                    data = analyze_full(name, slug, sheets, biz_info)
+                    biz_info, yahoo_data = _enrich_with_yahoo(slug, _merge_meta_into_biz(sheets, scrape_business_info(slug)))
+                    data = analyze_full(name, slug, sheets, biz_info, yahoo_data)
         except req.RequestException as e:
             log.warning("/api/pdf fetch failed for slug=%s: %s", slug, e)
             return jsonify({"error": "Failed to fetch data from Screener.in."}), 502
