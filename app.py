@@ -436,6 +436,16 @@ def _parse_html_table(table):
     return data, years
 
 
+def _merge_meta_into_biz(sheets, biz_info):
+    """Copy industry from sheets Meta into biz_info if biz_info is missing it."""
+    meta = sheets.get("Meta", {}).get("data", {}).get("Meta", {})
+    if not biz_info.get("industry") and meta.get("Industry"):
+        biz_info["industry"] = meta["Industry"]
+    if not biz_info.get("market_cap") and meta.get("Market Cap"):
+        biz_info["market_cap"] = meta["Market Cap"]
+    return biz_info
+
+
 def scrape_html(slug):
     """Scrape financial data directly from the Screener.in HTML page (no login needed).
     Returns the same sheets dict that parse_excel produces."""
@@ -465,26 +475,81 @@ def scrape_html(slug):
         if data:
             sections[sheet_name] = {"data": data, "years": years}
 
-    # Parse top-level key ratios (Market Cap, P/E, ROE, etc.) into a Meta section
+    # Parse top-level key ratios using .name/.number selectors (no colon in text)
     meta_data = {}
     for li in soup.select(".company-ratios li"):
-        text = li.get_text(" ", strip=True)
-        m = re.match(r"([^:]+):\s*(.*)", text)
-        if m:
-            key, val = m.group(1).strip(), m.group(2).strip()
-            fv = safe_float(val.replace("%", "").replace(",", ""))
-            if fv is not None:
-                meta_data[key] = fv
-    if meta_data:
-        sections["Meta"] = {"data": {"Meta": meta_data}, "years": []}
+        name_el = li.select_one(".name")
+        val_el = li.select_one(".value")
+        if not name_el or not val_el:
+            continue
+        key = name_el.get_text(strip=True)
+        num_el = val_el.select_one(".number")
+        raw_val = num_el.get_text(strip=True) if num_el else val_el.get_text(strip=True)
+        raw_val = raw_val.replace("₹", "").replace(",", "").replace("%", "").replace("Cr.", "").strip()
+        fv = safe_float(raw_val)
+        if fv is not None:
+            meta_data[key] = fv
 
-    # Inject industry and description from page
+    # Also inject industry and description from page
     industry_el = soup.find("a", href=lambda h: h and "/industry/" in h)
     if industry_el:
         meta_data["Industry"] = industry_el.get_text(strip=True)
+    else:
+        peer_sec = soup.find("section", id="peers")
+        if peer_sec:
+            peer_text = peer_sec.get_text(" ", strip=True)
+            parts = peer_text.split("Peer comparison")
+            if len(parts) > 1:
+                chain = parts[1].split("Part of")[0].strip()
+                industry_words = chain.split()
+                if len(industry_words) >= 4:
+                    meta_data["Industry"] = " ".join(industry_words[-4:])
+                elif industry_words:
+                    meta_data["Industry"] = chain
     desc_el = soup.find("meta", attrs={"name": "description"})
     if desc_el and desc_el.get("content"):
         meta_data["Description"] = desc_el["content"]
+
+    if meta_data:
+        sections["Meta"] = {"data": {"Meta": meta_data}, "years": []}
+
+    # Inject a Price section so compute_ratios can find the current price
+    current_price = meta_data.get("Current Price")
+    if current_price:
+        pl_years = sections.get("Profit & Loss", {}).get("years", [])
+        if pl_years:
+            sections["Price"] = {"data": {"PRICE": {pl_years[-1]: current_price}}, "years": pl_years}
+        else:
+            sections["Price"] = {"data": {"PRICE": {"current": current_price}}, "years": ["current"]}
+
+    # Inject BVPS into Balance Sheet from Book Value top ratio
+    book_value = meta_data.get("Book Value")
+    if book_value:
+        bs_data = sections.get("Balance Sheet", {}).get("data", {})
+        bs_years = sections.get("Balance Sheet", {}).get("years", [])
+        if bs_years:
+            bv_series = {yr: book_value for yr in bs_years}
+            bs_data["Book Value per Share"] = bv_series
+
+    # Estimate share count from Market Cap and Current Price for EPS computation
+    mcap = meta_data.get("Market Cap")
+    if mcap and current_price and current_price > 0:
+        est_shares_cr = mcap / current_price  # in Crores
+        bs_data = sections.get("Balance Sheet", {}).get("data", {})
+        bs_years = sections.get("Balance Sheet", {}).get("years", [])
+        if bs_years and "Book Value per Share" in bs_data:
+            # Compute shares = (Equity + Reserves) / BVPS
+            eq_cap = bs_data.get("Equity Capital", {})
+            reserves = bs_data.get("Reserves", {})
+            shares_series = {}
+            for yr in bs_years:
+                eq = eq_cap.get(yr, 0) or 0
+                res = reserves.get(yr, 0) or 0
+                bv = bs_data.get("Book Value per Share", {}).get(yr)
+                if bv and bv > 0:
+                    shares_series[yr] = round((eq + res) / bv, 2)
+            if shares_series:
+                bs_data["No. of Equity Shares"] = shares_series
 
     return sections
 
@@ -2091,6 +2156,7 @@ def get_live_price(slug, company_name=""):
 
 def scrape_business_info(slug):
     """Scrape company page for business description, industry, and shareholding."""
+    from bs4 import BeautifulSoup
     info = {"industry": None, "description": None, "market_cap": None,
             "promoter_holding": None, "institutional_holding": None}
     try:
@@ -2099,7 +2165,9 @@ def scrape_business_info(slug):
         if r.status_code != 200:
             return info
 
-        # Industry — found in breadcrumb or description
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # Industry — found in breadcrumb
         m = re.search(r'<a[^>]*href="/industry/[^"]*"[^>]*>([^<]+)</a>', r.text)
         if m:
             info["industry"] = m.group(1).strip()
@@ -2109,24 +2177,31 @@ def scrape_business_info(slug):
         if m:
             info["description"] = m.group(1).strip()
 
-        # Market cap — try multiple patterns
-        m = re.search(r'[Mm]kt\s*[Cc]ap[:\s]*₹?([\d,]+(?:\.\d+)?)\s*[Cc]r', r.text, re.I)
-        if not m:
-            m = re.search(r'[Mm]cap[:\s]*₹?([\d,]+(?:\.\d+)?)\s*[Cc]r', r.text, re.I)
-        if not m:
-            m = re.search(r'Market Cap[:\s]*₹?([\d,]+(?:\.\d+)?)', r.text, re.I)
-        if m:
-            info["market_cap"] = safe_float(m.group(1))
+        # Market cap — use CSS selectors (reliable, no regex needed)
+        for li in soup.select(".company-ratios li"):
+            name_el = li.select_one(".name")
+            num_el = li.select_one(".number")
+            if not name_el or not num_el:
+                continue
+            key = name_el.get_text(strip=True)
+            raw_val = num_el.get_text(strip=True).replace(",", "")
+            if key == "Market Cap":
+                info["market_cap"] = safe_float(raw_val)
+            elif key == "ROE":
+                info["institutional_holding"] = info.get("institutional_holding")  # keep existing
 
-        # Promoter holding
-        m = re.search(r'Promoter\s+Holding[:\s]*([\d.]+)%', r.text, re.I)
-        if m:
-            info["promoter_holding"] = safe_float(m.group(1))
-
-        # Institutional holding
-        m = re.search(r'Institutional\s+Holding[:\s]*([\d.]+)%', r.text, re.I)
-        if m:
-            info["institutional_holding"] = safe_float(m.group(1))
+        # Promoter holding from shareholding table
+        sh_sec = soup.find("section", id="shareholding")
+        if sh_sec:
+            table = sh_sec.find("table")
+            if table:
+                rows = table.find_all("tr")
+                for row in rows:
+                    cells = [c.get_text(strip=True) for c in row.find_all(["th", "td"])]
+                    if cells and "promoter" in cells[0].lower():
+                        if len(cells) >= 2:
+                            info["promoter_holding"] = safe_float(cells[-1].replace("%", ""))
+                        break
 
     except (req.RequestException, re.error, TypeError) as e:
         log.warning("scrape_business_info failed for %s: %s", slug, e)
@@ -3512,7 +3587,7 @@ def analyze_route():
                 resp.headers["Cache-Control"] = "no-store"
                 return resp, 400
             compute_ratios(sheets)
-            biz_info = scrape_business_info(slug)
+            biz_info = _merge_meta_into_biz(sheets, scrape_business_info(slug))
             result = analyze_full(name, slug, sheets, biz_info)
             _ANALYZE_CACHE[slug] = (now, result)
             resp = jsonify(result)
@@ -3553,7 +3628,7 @@ def analyze_route():
                 resp.headers["Cache-Control"] = "no-store"
                 return resp, 401
             compute_ratios(sheets)
-            biz_info = scrape_business_info(slug)
+            biz_info = _merge_meta_into_biz(sheets, scrape_business_info(slug))
             result = analyze_full(name, slug, sheets, biz_info)
         else:
             sheets = parse_excel(BytesIO(r3.content))
@@ -3688,7 +3763,7 @@ def generate_pdf():
                 if not sheets or "Profit & Loss" not in sheets:
                     return jsonify({"error": "Could not fetch data from Screener.in."}), 400
                 compute_ratios(sheets)
-                biz_info = scrape_business_info(slug)
+                biz_info = _merge_meta_into_biz(sheets, scrape_business_info(slug))
                 data = analyze_full(name, slug, sheets, biz_info)
             else:
                 export_url = BASE + match.group(1)
@@ -3714,11 +3789,11 @@ def generate_pdf():
                     if not sheets or "Profit & Loss" not in sheets:
                         return jsonify({"error": "Could not fetch data from Screener.in."}), 401
                     compute_ratios(sheets)
-                    biz_info = scrape_business_info(slug)
+                    biz_info = _merge_meta_into_biz(sheets, scrape_business_info(slug))
                     data = analyze_full(name, slug, sheets, biz_info)
                 else:
                     sheets = parse_excel(BytesIO(r3.content))
-                    biz_info = scrape_business_info(slug)
+                    biz_info = _merge_meta_into_biz(sheets, scrape_business_info(slug))
                     data = analyze_full(name, slug, sheets, biz_info)
         except req.RequestException as e:
             log.warning("/api/pdf fetch failed for slug=%s: %s", slug, e)
