@@ -981,11 +981,11 @@ async function fetchSuggestions(q) {
   const data = await res.json();
   if (!data.length) { dropdown.style.display = 'none'; return; }
   dropdown.innerHTML = data.map(c => `
-    <div class="drop-item" data-slug="${c.url.split('/').filter(Boolean)[1]}" data-name="${c.name}" data-url="${c.url}">
+    <div class="drop-item" data-slug="${escHtml(c.url.split('/').filter(Boolean)[1])}" data-name="${escHtml(c.name)}" data-url="${escHtml(c.url)}">
       <span class="drop-icon">📈</span>
       <div>
-        <div class="drop-name">${c.name}</div>
-        <div class="drop-url">${c.url}</div>
+        <div class="drop-name">${escHtml(c.name)}</div>
+        <div class="drop-url">${escHtml(c.url)}</div>
       </div>
     </div>`).join('');
   dropdown.style.display = 'block';
@@ -1049,7 +1049,7 @@ function showSearchHistory() {
   const h = JSON.parse(localStorage.getItem('ss_history') || '[]');
   if (!h.length) { dd.style.display = 'none'; return; }
   dd.innerHTML = `<div style="padding:6px 14px 2px;font-size:10px;color:var(--muted);letter-spacing:.1em;text-transform:uppercase;border-bottom:1px solid var(--border)">Recent</div>` +
-    h.map(s => `<div class="drop-item" data-slug="${s.slug}" data-name="${s.name}"><span class="drop-icon">🕐</span><span class="drop-name">${s.name}</span></div>`).join('');
+    h.map(s => `<div class="drop-item" data-slug="${escHtml(s.slug)}" data-name="${escHtml(s.name)}"><span class="drop-icon">🕐</span><span class="drop-name">${escHtml(s.name)}</span></div>`).join('');
   dd.style.display = 'block';
 }
 
@@ -1080,11 +1080,11 @@ async function fetchSuggestionsUS(q) {
   const data = await res.json();
   if (!data || !data.length) { dropdown.style.display = 'none'; return; }
   dropdown.innerHTML = data.map(c => `
-    <div class="drop-item" data-ticker="${c.ticker}" data-name="${c.name}" data-sector="${c.sector || ''}">
+    <div class="drop-item" data-ticker="${escHtml(c.ticker)}" data-name="${escHtml(c.name)}" data-sector="${escHtml(c.sector || '')}">
       <span class="drop-icon">🇺🇸</span>
       <div>
-        <div class="drop-name">${c.name} <span style="font-size:10px;color:var(--muted);font-family:'DM Mono',monospace">${c.ticker}</span></div>
-        <div class="drop-url">${c.sector} ${c.price ? '• ' + c.price : ''}</div>
+        <div class="drop-name">${escHtml(c.name)} <span style="font-size:10px;color:var(--muted);font-family:'DM Mono',monospace">${escHtml(c.ticker)}</span></div>
+        <div class="drop-url">${escHtml(c.sector)} ${c.price ? '• ' + escHtml(c.price) : ''}</div>
       </div>
     </div>`).join('');
   dropdown.style.display = 'block';
@@ -1131,7 +1131,7 @@ async function loadSectors() {
     const sectors = await res.json();
     const icons = ['💻','🏥','🏦','🛒','⛽','📡','🏭','⚡','🏠','🧪','🧬','🥫'];
     grid.innerHTML = sectors.map((s, i) =>
-      `<div class="sector-chip" onclick="analyzeSector('${s}')"><span class="chip-icon">${icons[i % icons.length]}</span>${s}</div>`
+      `<div class="sector-chip" onclick="analyzeSector(this.dataset.sector)" data-sector="${escHtml(s)}"><span class="chip-icon">${icons[i % icons.length]}</span>${escHtml(s)}</div>`
     ).join('');
   } catch(e) {
     grid.innerHTML = '<div style="color:var(--muted);font-size:12px">Failed to load sectors</div>';
@@ -1147,11 +1147,11 @@ async function analyzeSector(sector) {
     const res = await fetch(`/api/us/sector?sector=${encodeURIComponent(sector)}&_=${Date.now()}`);
     const data = await res.json();
     loading.style.display = 'none';
-    if (data.error) { resultsDiv.innerHTML = `<div style="color:var(--red)">${data.error}</div>`; resultsDiv.style.display = 'block'; return; }
+    if (data.error) { resultsDiv.innerHTML = `<div style="color:var(--red)">${escHtml(data.error)}</div>`; resultsDiv.style.display = 'block'; return; }
     renderSectorResults(data, resultsDiv);
   } catch(e) {
     loading.style.display = 'none';
-    resultsDiv.innerHTML = `<div style="color:var(--red)">Error: ${e.message}</div>`;
+    resultsDiv.innerHTML = `<div style="color:var(--red)">Error: ${escHtml(e.message)}</div>`;
     resultsDiv.style.display = 'block';
   }
 }
@@ -1161,7 +1161,7 @@ function renderSectorResults(data, el) {
   const stocks = data.ranked_stocks || [];
   let html = `
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
-      <div style="font-family:'Syne',sans-serif;font-size:20px;font-weight:700;color:var(--text)">${s} Sector</div>
+      <div style="font-family:'Syne',sans-serif;font-size:20px;font-weight:700;color:var(--text)">${escHtml(s)} Sector</div>
       <div style="font-size:12px;color:var(--muted)">${stocks.length} stocks ranked</div>
     </div>
     <div style="overflow-x:auto">
@@ -1182,10 +1182,10 @@ function renderSectorResults(data, el) {
         ${stocks.map((st, i) => {
           const scoreColor = st.overall_score >= 60 ? 'var(--green)' : st.overall_score >= 40 ? 'var(--amber)' : 'var(--red)';
           const vColor = st.verdict === 'STRONG BUY' || st.verdict === 'BUY' ? 'var(--green)' : st.verdict === 'AVOID' ? 'var(--red)' : 'var(--amber)';
-          return `<tr style="border-bottom:1px solid var(--border);cursor:pointer" onclick="analyzeUSTicker('${st.ticker}')">
+          return `<tr style="border-bottom:1px solid var(--border);cursor:pointer" onclick="analyzeUSTicker(this.dataset.ticker)" data-ticker="${escHtml(st.ticker)}">
             <td style="padding:10px 12px;color:var(--muted)">${i+1}</td>
-            <td style="padding:10px 12px;font-family:'DM Mono',monospace;color:var(--acc);font-weight:600">${st.ticker}</td>
-            <td style="padding:10px 12px;color:var(--text)">${st.name}</td>
+            <td style="padding:10px 12px;font-family:'DM Mono',monospace;color:var(--acc);font-weight:600">${escHtml(st.ticker)}</td>
+            <td style="padding:10px 12px;color:var(--text)">${escHtml(st.name)}</td>
             <td style="padding:10px 12px;text-align:center;font-family:'Syne',sans-serif;font-weight:800;color:${scoreColor}">${st.overall_score}</td>
             <td style="padding:10px 12px;text-align:center;color:${vColor};font-weight:600;font-size:11px">${st.verdict}</td>
             <td style="padding:10px 12px;text-align:right;color:var(--text)">${st.metrics.pe !== null ? st.metrics.pe : '—'}</td>
@@ -1320,22 +1320,22 @@ function renderResults(A) {
   results.innerHTML = `
     <div class="results-header fade-in">
       <div>
-        <div class="company-title">${A.company_name} ${b.industry && b.industry !== 'N/A' ? `<span class="sector-badge">${b.industry}</span>` : ''}</div>
-        <div class="gen-time">Generated ${A.generated_at}</div>
+        <div class="company-title">${escHtml(A.company_name)} ${b.industry && b.industry !== 'N/A' ? `<span class="sector-badge">${escHtml(b.industry)}</span>` : ''}</div>
+        <div class="gen-time">Generated ${escHtml(A.generated_at)}</div>
       </div>
       <div style="display:flex;gap:8px">
-        <button class="btn-share" onclick="shareAnalysis('${A.company_name}')">🔗 Share</button>
+        <button class="btn-share" onclick="shareAnalysis(this.dataset.name)" data-name="${escHtml(A.company_name)}">🔗 Share</button>
         <button class="btn-pdf" onclick="downloadPDF()">⬇️ PDF</button>
       </div>
     </div>
 
     <!-- VERDICT -->
-    <div class="verdict-banner ${A.v_cls} fade-in">
+    <div class="verdict-banner ${escHtml(A.v_cls)} fade-in">
       <div>
         <div style="font-size:12px;color:var(--muted);letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px">Fundamentals Verdict</div>
-        <div class="verdict-label">${A.verdict}</div>
+        <div class="verdict-label">${escHtml(A.verdict)}</div>
       </div>
-      <div class="verdict-score"><span>${A.overall}</span> / 10</div>
+      <div class="verdict-score"><span>${escHtml(String(A.overall))}</span> / 10</div>
     </div>
 
     <!-- BUSINESS OVERVIEW -->
@@ -1346,7 +1346,7 @@ function renderResults(A) {
         <div class="metric-grid">
           <div class="metric-item">
             <div class="metric-label">Industry</div>
-            <div class="metric-value" style="font-size:14px">${b.industry || 'N/A'}</div>
+            <div class="metric-value" style="font-size:14px">${escHtml(b.industry || 'N/A')}</div>
           </div>
           <div class="metric-item">
             <div class="metric-label">Market Cap</div>
@@ -1354,7 +1354,7 @@ function renderResults(A) {
           </div>
           <div class="metric-item">
             <div class="metric-label">Category</div>
-            <div class="metric-value" style="font-size:14px">${b.market_cap_category || 'N/A'}</div>
+            <div class="metric-value" style="font-size:14px">${escHtml(b.market_cap_category || 'N/A')}</div>
           </div>
         </div>
       </div>
@@ -1373,7 +1373,7 @@ function renderResults(A) {
       </div>
       <div class="card" style="grid-column:span 1">
         <div class="card-title">📄 Description</div>
-        <div style="font-size:12px;color:var(--muted);line-height:1.5">${b.description || 'No description available.'}</div>
+        <div style="font-size:12px;color:var(--muted);line-height:1.5">${escHtml(b.description || 'No description available.')}</div>
       </div>
     </div>
 

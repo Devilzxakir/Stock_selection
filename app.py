@@ -4,10 +4,12 @@ Run: python app.py
 Visit: http://localhost:5000
 """
 
+import logging
 from flask import Flask, request, jsonify, render_template, send_file
 import requests as req
 import pandas as pd
 import math, re, os, io
+import time
 from datetime import datetime, timedelta
 from io import BytesIO
 
@@ -21,17 +23,101 @@ from reportlab.platypus import (
 )
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("stocksense")
+
 app = Flask(__name__)
 
+# ── HARD LIMITS (production) ──────────────────────────────────────────────────
+MAX_UPLOAD_BYTES  = 10 * 1024 * 1024          # 10 MB cap on Excel upload
+MAX_REMOTE_BYTES  = 25 * 1024 * 1024          # 25 MB cap on Screener.in response
+REQUEST_TIMEOUT   = (5, 12)                   # (connect, read) for cheap calls
+SLUG_RE           = re.compile(r"^[a-z0-9][a-z0-9\-]{0,79}$")  # validate slugs
+TICKER_RE         = re.compile(r"^[A-Z][A-Z0-9\.\-]{0,9}$")    # validate tickers
+
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
+
+# ── CACHE (in-memory, per-instance) ───────────────────────────────────────────
+_ANALYZE_CACHE = {}              # slug -> (ts, result_dict)
+_ANALYZE_TTL   = timedelta(minutes=15)
+_LIVE_CACHE    = {}              # slug -> (ts, dict)
+_LIVE_TTL      = timedelta(minutes=2)
+_RATE_BUCKET   = {}              # ip   -> [timestamps]
+_RATE_WINDOW   = 60              # seconds
+_RATE_MAX      = 30              # requests per window per IP
+
+def _rate_limit():
+    """Per-IP fixed window limiter. Returns None if OK, or a 429 response."""
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "anon").split(",")[0].strip()
+    now = time.time()
+    bucket = _RATE_BUCKET.setdefault(ip, [])
+    cutoff = now - _RATE_WINDOW
+    _RATE_BUCKET[ip] = [t for t in bucket if t > cutoff]
+    if len(_RATE_BUCKET[ip]) >= _RATE_MAX:
+        resp = jsonify({"error": "Too many requests. Please slow down."})
+        resp.status_code = 429
+        resp.headers["Retry-After"] = str(_RATE_WINDOW)
+        return resp
+    _RATE_BUCKET[ip].append(now)
+    return None
+
+# ── SECURITY HEADERS ──────────────────────────────────────────────────────────
+@app.after_request
+def _security_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    resp.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+    if request.endpoint in (None, "index"):
+        resp.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "img-src 'self' data:; "
+            "style-src 'self' https://fonts.googleapis.com 'unsafe-inline'; "
+            "font-src https://fonts.gstatic.com; "
+            "connect-src 'self'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "frame-ancestors 'none'"
+        )
+    return resp
+
+# ── ERROR HANDLERS (no trace leaks, no leaked stack to client) ───────────────
+@app.errorhandler(404)
+def _not_found(_):
+    return jsonify({"error": "Not found"}), 404
+
+@app.errorhandler(413)
+def _too_large(_):
+    return jsonify({"error": f"File too large. Max {MAX_UPLOAD_BYTES // (1024*1024)} MB."}), 413
+
+@app.errorhandler(500)
+def _server_error(e):
+    log.exception("Unhandled server error")
+    return jsonify({"error": "Internal server error"}), 500
+
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-SESSION_ID = os.environ.get("SESSION_ID", "wd45cahfg2g5q6tqyabmkfw7zjih1bbb")
-BASE       = "https://www.screener.in"
-HEADERS    = {
+# Screener.in session cookie. Required in production; falls back to a dev value
+# only when explicitly running locally.
+SESSION_ID = os.environ.get("SESSION_ID")
+if not SESSION_ID:
+    if os.environ.get("VERCEL"):
+        # Fail closed on Vercel if not configured
+        log.warning("SESSION_ID env var not set on Vercel — Screener scraping will fail.")
+        SESSION_ID = ""
+    else:
+        SESSION_ID = "wd45cahfg2g5q6tqyabmkfw7zjih1bbb"
+
+BASE    = "https://www.screener.in"
+HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     "Accept": "application/json, text/html, */*",
     "Referer": "https://www.screener.in/",
 }
-COOKIES = {"sessionid": SESSION_ID}
+COOKIES = {"sessionid": SESSION_ID} if SESSION_ID else {}
 
 # ── Industry classification for 20-point framework ──
 GROWING_INDUSTRIES = [
@@ -54,13 +140,13 @@ def safe_float(val):
     try:
         v = float(str(val).replace(",", "").strip())
         return None if math.isnan(v) else v
-    except:
+    except (ValueError, TypeError, OverflowError):
         return None
 
 def parse_sheet(xls, sheet_name):
     try:
         df = xls.parse(sheet_name, header=None)
-    except:
+    except (ValueError, KeyError):
         return None, []
     years = [str(c).strip() for c in df.iloc[0, 1:].tolist()]
     data  = {}
@@ -325,6 +411,83 @@ def compute_ratios(sections):
 
     if key_data:
         sections["Key"] = {"data": key_data, "years": key_years}
+
+def _parse_html_table(table):
+    """Parse an HTML <table> into {metric: {year: value}}, years list."""
+    from bs4 import BeautifulSoup
+    rows = table.find_all("tr")
+    if not rows:
+        return {}, []
+    header = [c.get_text(strip=True) for c in rows[0].find_all(["th", "td"])]
+    years = [h for h in header[1:] if h]
+    data = {}
+    for row in rows[1:]:
+        cells = [c.get_text(strip=True) for c in row.find_all(["th", "td"])]
+        if not cells or not cells[0]:
+            continue
+        metric = cells[0].rstrip("+")
+        series = {}
+        for yr, val in zip(years, cells[1:]):
+            fv = safe_float(val.replace("%", ""))
+            if fv is not None:
+                series[yr] = fv
+        if series:
+            data[metric] = series
+    return data, years
+
+
+def scrape_html(slug):
+    """Scrape financial data directly from the Screener.in HTML page (no login needed).
+    Returns the same sheets dict that parse_excel produces."""
+    from bs4 import BeautifulSoup
+
+    url = f"{BASE}/company/{slug}/consolidated/"
+    r = req.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    SECTION_MAP = {
+        "profit-loss": "Profit & Loss",
+        "quarters":    "Quarters",
+        "balance-sheet": "Balance Sheet",
+        "cash-flow":   "Cash Flow",
+        "ratios":      "Ratios",
+    }
+    sections = {}
+    for sec_id, sheet_name in SECTION_MAP.items():
+        sec = soup.find("section", id=sec_id)
+        if not sec:
+            continue
+        table = sec.find("table")
+        if not table:
+            continue
+        data, years = _parse_html_table(table)
+        if data:
+            sections[sheet_name] = {"data": data, "years": years}
+
+    # Parse top-level key ratios (Market Cap, P/E, ROE, etc.) into a Meta section
+    meta_data = {}
+    for li in soup.select(".company-ratios li"):
+        text = li.get_text(" ", strip=True)
+        m = re.match(r"([^:]+):\s*(.*)", text)
+        if m:
+            key, val = m.group(1).strip(), m.group(2).strip()
+            fv = safe_float(val.replace("%", "").replace(",", ""))
+            if fv is not None:
+                meta_data[key] = fv
+    if meta_data:
+        sections["Meta"] = {"data": {"Meta": meta_data}, "years": []}
+
+    # Inject industry and description from page
+    industry_el = soup.find("a", href=lambda h: h and "/industry/" in h)
+    if industry_el:
+        meta_data["Industry"] = industry_el.get_text(strip=True)
+    desc_el = soup.find("meta", attrs={"name": "description"})
+    if desc_el and desc_el.get("content"):
+        meta_data["Description"] = desc_el["content"]
+
+    return sections
+
 
 def parse_excel(excel_bytes):
     xls    = pd.ExcelFile(excel_bytes)
@@ -646,7 +809,8 @@ def magic_formula_rank(key, pl, bs, price, shares_outstanding):
             "ev": round(ev, 2) if ev else None,
             "formulas": formulas,
         }
-    except:
+    except (TypeError, ValueError, IndexError, ZeroDivisionError) as e:
+        log.warning("magic_formula_rank failed: %s", e)
         return {"roce": None, "earnings_yield": None}
 
 
@@ -1896,10 +2060,12 @@ def get_live_price(slug, company_name=""):
                         "market_cap": info.get("marketCap"),
                         "source": f"Yahoo Finance ({t})",
                     }
-            except:
+            except (KeyError, TypeError):
                 continue
-    except:
-        pass
+    except ImportError:
+        log.warning("yfinance not installed — live price unavailable")
+    except Exception as e:
+        log.warning("Live price fetch failed for %s: %s", slug, e)
 
     # Fallback: scrape from Screener.in company page
     try:
@@ -1914,8 +2080,8 @@ def get_live_price(slug, company_name=""):
             price = safe_float(m.group(1))
             if price:
                 return {"price": price, "source": "Screener.in (live)"}
-    except:
-        pass
+    except (req.RequestException, re.error) as e:
+        log.warning("Screener.in price scrape failed for %s: %s", slug, e)
     return None
 
 
@@ -1962,8 +2128,8 @@ def scrape_business_info(slug):
         if m:
             info["institutional_holding"] = safe_float(m.group(1))
 
-    except:
-        pass
+    except (req.RequestException, re.error, TypeError) as e:
+        log.warning("scrape_business_info failed for %s: %s", slug, e)
     return info
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1985,7 +2151,8 @@ def valuation_engine(eps, bvps, current_price, rev_cagr, pro_cagr,
                 "formula": f"√(22.5 × EPS {eps:.1f} × BVPS {bvps:.1f})",
                 "weight": 0.20, "desc": "Benjamin Graham conservative formula"
             }
-    except: pass
+    except (TypeError, ValueError):
+        pass
 
     # Graham Growth
     try:
@@ -1997,7 +2164,8 @@ def valuation_engine(eps, bvps, current_price, rev_cagr, pro_cagr,
                 "formula": f"EPS {eps:.1f} × (8.5 + 2×{g_pct:.0f}%) × 4.4 / {AAA}%",
                 "weight": 0.25, "desc": "Growth-adjusted Graham formula"
             }
-    except: pass
+    except (TypeError, ValueError):
+        pass
 
     # DCF
     try:
@@ -2016,7 +2184,8 @@ def valuation_engine(eps, bvps, current_price, rev_cagr, pro_cagr,
                 "formula": f"r=12%, g1={g1*100:.0f}%, g2={g2*100:.0f}%, gT=4%",
                 "weight": 0.30, "desc": "10-year discounted cash flow"
             }
-    except: pass
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
 
     # PEG
     try:
@@ -2030,7 +2199,8 @@ def valuation_engine(eps, bvps, current_price, rev_cagr, pro_cagr,
                 "weight": 0.15, "desc": "Peter Lynch PEG=1 fair value",
                 "peg_actual": round(peg_actual, 2) if peg_actual else None
             }
-    except: pass
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
 
     # EV/EBITDA
     try:
@@ -2045,7 +2215,8 @@ def valuation_engine(eps, bvps, current_price, rev_cagr, pro_cagr,
                 "formula": f"14x × EBITDA {ebitda_val:.0f}Cr − Debt + Cash / shares",
                 "weight": 0.10, "desc": "Enterprise value to EBITDA multiple"
             }
-    except: pass
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
 
     if not results or not current_price:
         return None
@@ -2672,7 +2843,7 @@ def _us_label(ticker, info=None):
         try:
             import yfinance as yf
             info = yf.Ticker(ticker).info or {}
-        except:
+        except (ImportError, KeyError, TypeError):
             info = {}
     name = info.get("longName") or info.get("shortName") or ticker
     sector = info.get("sector", "")
@@ -2693,7 +2864,7 @@ def us_search(q):
         info = tk.info or {}
         if info.get("longName") or info.get("shortName"):
             results.append(_us_label(q, info))
-    except:
+    except (KeyError, TypeError):
         pass
     # Search by name in sector lists
     for sector, tickers in US_SECTORS.items():
@@ -2703,7 +2874,7 @@ def us_search(q):
                     try:
                         tk = yf.Ticker(t)
                         results.append(_us_label(t, tk.info or {}))
-                    except:
+                    except (KeyError, TypeError):
                         results.append({"ticker": t, "name": t, "sector": sector, "industry": "", "price": ""})
                     if len(results) >= 6:
                         break
@@ -2735,7 +2906,8 @@ def fetch_us_financials(ticker):
             if isinstance(v, complex): return round(v.real, 2)
             if isinstance(v, (int, float)): return round(float(v), 2)
             return round(float(v), 2)
-        except: return None
+        except (TypeError, ValueError, OverflowError):
+            return None
 
     def collect(fin_df):
         """Convert yfinance DataFrame to {metric: {year: val}}."""
@@ -3282,41 +3454,75 @@ def index():
 
 @app.route("/api/search")
 def search():
+    rl = _rate_limit()
+    if rl:
+        return rl
     q = request.args.get("q", "").strip()
     if not q:
         return jsonify({"error": "Empty query"}), 400
+    if len(q) > 100:
+        return jsonify({"error": "Query too long"}), 400
     try:
         url = f"{BASE}/api/company/search/?q={req.utils.quote(q)}&v=3"
-        r   = req.get(url, headers=HEADERS, cookies=COOKIES, timeout=10)
+        r   = req.get(url, headers=HEADERS, cookies=COOKIES, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         return jsonify(r.json()[:6])
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except req.RequestException as e:
+        log.warning("/api/search failed: %s", e)
+        return jsonify({"error": "Search unavailable"}), 502
 
 
 @app.route("/api/analyze")
 def analyze_route():
-    slug = request.args.get("slug", "").strip()
+    rl = _rate_limit()
+    if rl:
+        return rl
+    slug = request.args.get("slug", "").strip().lower()
     name = request.args.get("name", slug)
     if not slug:
         return jsonify({"error": "No slug"}), 400
+    if not SLUG_RE.match(slug):
+        return jsonify({"error": "Invalid slug format"}), 400
+    if len(name) > 200:
+        name = name[:200]
+
+    # Check cache
+    now = datetime.now()
+    cache_entry = _ANALYZE_CACHE.get(slug)
+    if cache_entry and (now - cache_entry[0]) < _ANALYZE_TTL:
+        log.info("Cache hit for /api/analyze slug=%s", slug)
+        resp = jsonify(cache_entry[1])
+        resp.headers["Cache-Control"] = "public, max-age=900"
+        return resp
+
     try:
         # get export url
         page_url = f"{BASE}/company/{slug}/consolidated/"
-        r        = req.get(page_url, headers=HEADERS, cookies=COOKIES, timeout=15)
+        r        = req.get(page_url, headers=HEADERS, cookies=COOKIES, timeout=REQUEST_TIMEOUT)
         match    = re.search(r'(?:href|formaction)="(/user/company/export/\d+/)"', r.text)
         if not match:
             page_url = f"{BASE}/company/{slug}/"
-            r        = req.get(page_url, headers=HEADERS, cookies=COOKIES, timeout=15)
+            r        = req.get(page_url, headers=HEADERS, cookies=COOKIES, timeout=REQUEST_TIMEOUT)
             match    = re.search(r'(?:href|formaction)="(/user/company/export/\d+/)"', r.text)
         if not match:
-            resp = jsonify({"error": "Couldn't fetch data. The Screener.in session may have expired. Try uploading an Excel file instead."})
-            resp.headers["Cache-Control"] = "no-store"
-            return resp, 400
+            log.info("No export URL for slug=%s, falling back to HTML scrape", slug)
+            sheets = scrape_html(slug)
+            if not sheets or "Profit & Loss" not in sheets:
+                resp = jsonify({"error": "Could not fetch data from Screener.in. Try uploading an Excel file instead."})
+                resp.headers["Cache-Control"] = "no-store"
+                return resp, 400
+            compute_ratios(sheets)
+            biz_info = scrape_business_info(slug)
+            result = analyze_full(name, slug, sheets, biz_info)
+            _ANALYZE_CACHE[slug] = (now, result)
+            resp = jsonify(result)
+            resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+            resp.headers["Pragma"] = "no-cache"
+            return resp
 
         export_url = BASE + match.group(1)
         # GET the export page to obtain CSRF token
-        r2 = req.get(export_url, headers=HEADERS, cookies=COOKIES, timeout=30)
+        r2 = req.get(export_url, headers=HEADERS, cookies=COOKIES, timeout=(5, 15))
         r2.raise_for_status()
         csrf_match = re.search(r'csrfmiddlewaretoken[^>]+value="([^"]+)"', r2.text)
         if not csrf_match:
@@ -3328,23 +3534,51 @@ def analyze_route():
         all_cookies = {**COOKIES, **{k: v for k, v in r2.cookies.items()}}
         # POST to export URL with CSRF token to download the actual Excel file
         r3 = req.post(export_url, headers=HEADERS, cookies=all_cookies,
-                      data={"csrfmiddlewaretoken": csrf_token, "next": page_url}, timeout=30)
+                      data={"csrfmiddlewaretoken": csrf_token, "next": page_url},
+                      timeout=(5, 15))
         r3.raise_for_status()
-        if b"login" in r3.content[:500].lower() or len(r3.content) < 1000:
-            resp = jsonify({"error": "Screener.in session expired. Ask the developer to update the session ID, or upload an Excel file directly."})
-            resp.headers["Cache-Control"] = "no-store"
-            return resp, 401
 
-        sheets = parse_excel(BytesIO(r3.content))
-        biz_info = scrape_business_info(slug)
-        result = analyze_full(name, slug, sheets, biz_info)
+        # Validate response is actually an Excel file, not a login/register redirect
+        content = r3.content
+        is_excel = (content[:2] == b'PK'                    # .xlsx (ZIP)
+                    or content[:4] == b'\xd0\xcf\x11\xe0'  # .xls (OLE2)
+                    or (len(content) > 500
+                        and (b'worksheet' in content[:2000].lower()
+                             or b'<?xml' in content[:200].lower())))
+        if not is_excel:
+            log.info("Excel export failed for slug=%s, falling back to HTML scrape", slug)
+            sheets = scrape_html(slug)
+            if not sheets or "Profit & Loss" not in sheets:
+                resp = jsonify({"error": "Could not fetch data from Screener.in. Try uploading an Excel file instead."})
+                resp.headers["Cache-Control"] = "no-store"
+                return resp, 401
+            compute_ratios(sheets)
+            biz_info = scrape_business_info(slug)
+            result = analyze_full(name, slug, sheets, biz_info)
+        else:
+            sheets = parse_excel(BytesIO(r3.content))
+            biz_info = scrape_business_info(slug)
+            result = analyze_full(name, slug, sheets, biz_info)
+
+        # Store in cache
+        _ANALYZE_CACHE[slug] = (now, result)
+        # Evict old entries
+        for k, (ts, _) in list(_ANALYZE_CACHE.items()):
+            if (now - ts) > _ANALYZE_TTL:
+                del _ANALYZE_CACHE[k]
+
         resp = jsonify(result)
         resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         resp.headers["Pragma"] = "no-cache"
         return resp
+    except req.RequestException as e:
+        log.warning("/api/analyze failed for slug=%s: %s", slug, e)
+        resp = jsonify({"error": "Failed to fetch data from Screener.in. Please try again."})
+        resp.headers["Cache-Control"] = "no-store"
+        return resp, 502
     except Exception as e:
-        import traceback
-        resp = jsonify({"error": str(e), "trace": traceback.format_exc()})
+        log.exception("/api/analyze unexpected error for slug=%s", slug)
+        resp = jsonify({"error": "Analysis failed. Please try again or upload an Excel file."})
         resp.headers["Cache-Control"] = "no-store"
         return resp, 500
 
@@ -3352,6 +3586,9 @@ def analyze_route():
 @app.route("/api/analyze/excel", methods=["POST"])
 def analyze_excel():
     """Analyze from uploaded Screener.in Excel file."""
+    rl = _rate_limit()
+    if rl:
+        return rl
     try:
         if 'file' not in request.files:
             return jsonify({"error": "No file selected. Please choose an Excel file from your computer."}), 400
@@ -3360,13 +3597,17 @@ def analyze_excel():
         if not file.filename:
             return jsonify({"error": "The selected file appears to be empty. Please try a different file."}), 400
 
-        if not file.filename.endswith(('.xlsx', '.xls')):
+        if not file.filename.lower().endswith(('.xlsx', '.xls')):
             return jsonify({"error": "Please upload an Excel file (.xlsx or .xls) exported from Screener.in."}), 400
 
         # Read Excel file
         excel_bytes = file.read()
         if len(excel_bytes) < 1000:
             return jsonify({"error": "The file seems too small or empty. Please check the file and try again."}), 400
+
+        # Cap remote size
+        if len(excel_bytes) > MAX_UPLOAD_BYTES:
+            return jsonify({"error": f"File too large. Max {MAX_UPLOAD_BYTES // (1024*1024)} MB."}), 413
 
         # Parse Excel
         sheets = parse_excel(BytesIO(excel_bytes))
@@ -3390,12 +3631,13 @@ def analyze_excel():
 
         # If no company name from Meta, try to get from filename
         if company_name == "Unknown":
-            company_name = file.filename.replace('.xlsx', '').replace('.xls', '').replace('_', ' ').strip()
+            company_name = re.sub(r'[^a-zA-Z0-9\s\-.]', ' ',
+                                  file.filename.rsplit('.', 1)[0].replace('_', ' ')).strip()
             if company_name.lower().endswith('consolidated'):
                 company_name = company_name[:-12].strip()
 
         # Generate slug from company name
-        slug = company_name.lower().replace(' ', '-').replace('.', '').replace('(', '').replace(')', '')
+        slug = re.sub(r'[^a-z0-9\-]', '-', company_name.lower().strip())[:80]
 
         # Run analysis
         result = analyze_full(company_name, slug, sheets, biz_info)
@@ -3406,8 +3648,8 @@ def analyze_excel():
         return resp
 
     except Exception as e:
-        import traceback
-        resp = jsonify({"error": str(e), "trace": traceback.format_exc()})
+        log.exception("/api/analyze/excel unexpected error")
+        resp = jsonify({"error": "Analysis failed. Make sure the file is a valid Screener.in export."})
         resp.headers["Cache-Control"] = "no-store"
         return resp, 500
 
@@ -3415,33 +3657,111 @@ def analyze_excel():
 @app.route("/api/pdf")
 def generate_pdf():
     """Quick PDF download — pass same params as /analyze."""
-    slug = request.args.get("slug", "").strip()
+    rl = _rate_limit()
+    if rl:
+        return rl
+    slug = request.args.get("slug", "").strip().lower()
     name = request.args.get("name", slug)
     if not slug:
         return jsonify({"error": "No slug"}), 400
+    if not SLUG_RE.match(slug):
+        return jsonify({"error": "Invalid slug format"}), 400
 
-    # Re-analyze
-    r_json = app.test_client().get(f"/api/analyze?slug={slug}&name={req.utils.quote(name)}")
-    data   = r_json.get_json()
-    if "error" in data:
-        return jsonify(data), 400
+    # Try cache first, otherwise analyze
+    now = datetime.now()
+    cache_entry = _ANALYZE_CACHE.get(slug)
+    if cache_entry and (now - cache_entry[0]) < _ANALYZE_TTL:
+        data = cache_entry[1]
+    else:
+        try:
+            # Reuse the analysis logic directly instead of calling test_client
+            page_url = f"{BASE}/company/{slug}/consolidated/"
+            r = req.get(page_url, headers=HEADERS, cookies=COOKIES, timeout=REQUEST_TIMEOUT)
+            match = re.search(r'(?:href|formaction)="(/user/company/export/\d+/)"', r.text)
+            if not match:
+                page_url = f"{BASE}/company/{slug}/"
+                r = req.get(page_url, headers=HEADERS, cookies=COOKIES, timeout=REQUEST_TIMEOUT)
+                match = re.search(r'(?:href|formaction)="(/user/company/export/\d+/)"', r.text)
+            if not match:
+                log.info("No export URL for PDF slug=%s, falling back to HTML scrape", slug)
+                sheets = scrape_html(slug)
+                if not sheets or "Profit & Loss" not in sheets:
+                    return jsonify({"error": "Could not fetch data from Screener.in."}), 400
+                compute_ratios(sheets)
+                biz_info = scrape_business_info(slug)
+                data = analyze_full(name, slug, sheets, biz_info)
+            else:
+                export_url = BASE + match.group(1)
+                r2 = req.get(export_url, headers=HEADERS, cookies=COOKIES, timeout=(5, 15))
+                r2.raise_for_status()
+                csrf_match = re.search(r'csrfmiddlewaretoken[^>]+value="([^"]+)"', r2.text)
+                if not csrf_match:
+                    return jsonify({"error": "Screener.in session expired."}), 401
+                all_cookies = {**COOKIES, **{k: v for k, v in r2.cookies.items()}}
+                r3 = req.post(export_url, headers=HEADERS, cookies=all_cookies,
+                              data={"csrfmiddlewaretoken": csrf_match.group(1), "next": page_url},
+                              timeout=(5, 15))
+                r3.raise_for_status()
+                content = r3.content
+                is_excel = (content[:2] == b'PK'
+                            or content[:4] == b'\xd0\xcf\x11\xe0'
+                            or (len(content) > 500
+                                and (b'worksheet' in content[:2000].lower()
+                                     or b'<?xml' in content[:200].lower())))
+                if not is_excel:
+                    log.info("Excel export failed for PDF slug=%s, falling back to HTML scrape", slug)
+                    sheets = scrape_html(slug)
+                    if not sheets or "Profit & Loss" not in sheets:
+                        return jsonify({"error": "Could not fetch data from Screener.in."}), 401
+                    compute_ratios(sheets)
+                    biz_info = scrape_business_info(slug)
+                    data = analyze_full(name, slug, sheets, biz_info)
+                else:
+                    sheets = parse_excel(BytesIO(r3.content))
+                    biz_info = scrape_business_info(slug)
+                    data = analyze_full(name, slug, sheets, biz_info)
+        except req.RequestException as e:
+            log.warning("/api/pdf fetch failed for slug=%s: %s", slug, e)
+            return jsonify({"error": "Failed to fetch data from Screener.in."}), 502
+        except Exception as e:
+            log.exception("/api/pdf analysis failed for slug=%s", slug)
+            return jsonify({"error": "Analysis failed."}), 500
 
-    buf = build_pdf(data)
-    buf.seek(0)
-    safe = re.sub(r"[^\w]","_", name)
-    return send_file(buf, as_attachment=True,
-                     download_name=f"{safe}_analysis.pdf",
-                     mimetype="application/pdf")
+    try:
+        buf = build_pdf(data)
+        buf.seek(0)
+        safe = re.sub(r"[^\w]", "_", name)[:100]
+        return send_file(buf, as_attachment=True,
+                         download_name=f"{safe}_analysis.pdf",
+                         mimetype="application/pdf")
+    except Exception as e:
+        log.exception("/api/pdf build failed for slug=%s", slug)
+        return jsonify({"error": "PDF generation failed."}), 500
 
 
 @app.route("/api/live")
 def live_price():
-    slug = request.args.get("slug", "").strip()
+    rl = _rate_limit()
+    if rl:
+        return rl
+    slug = request.args.get("slug", "").strip().lower()
     name = request.args.get("name", slug)
     if not slug:
         return jsonify({"error": "No slug"}), 400
+    if not SLUG_RE.match(slug):
+        return jsonify({"error": "Invalid slug format"}), 400
+
+    # Check cache
+    now = datetime.now()
+    cache_entry = _LIVE_CACHE.get(slug)
+    if cache_entry and (now - cache_entry[0]) < _LIVE_TTL:
+        resp = jsonify(cache_entry[1])
+        resp.headers["Cache-Control"] = "public, max-age=120"
+        return resp
+
     live = get_live_price(slug, name)
     if live:
+        _LIVE_CACHE[slug] = (now, live)
         resp = jsonify(live)
     else:
         resp = jsonify({"error": "Live price not available", "price": None})
@@ -3455,21 +3775,32 @@ def live_price():
 
 @app.route("/api/us/search")
 def us_search_route():
+    rl = _rate_limit()
+    if rl:
+        return rl
     q = request.args.get("q", "").strip()
     if not q or len(q) < 1:
         return jsonify([])
+    if len(q) > 50:
+        return jsonify({"error": "Query too long"}), 400
     try:
         results = us_search(q)
         return jsonify(results)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        log.warning("/api/us/search failed: %s", e)
+        return jsonify({"error": "Search unavailable"}), 502
 
 
 @app.route("/api/us/analyze")
 def us_analyze_route():
+    rl = _rate_limit()
+    if rl:
+        return rl
     ticker = request.args.get("ticker", "").strip().upper()
     if not ticker:
         return jsonify({"error": "No ticker provided"}), 400
+    if not TICKER_RE.match(ticker):
+        return jsonify({"error": "Invalid ticker format"}), 400
     try:
         result = analyze_us_stock(ticker)
         # Inject sector context for peer comparison
@@ -3481,12 +3812,15 @@ def us_analyze_route():
         resp.headers["Cache-Control"] = "no-store"
         return resp
     except Exception as e:
-        import traceback
-        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+        log.exception("/api/us/analyze failed for ticker=%s", ticker)
+        return jsonify({"error": f"Analysis failed for {ticker}."}), 500
 
 
 @app.route("/api/us/sector")
 def us_sector_route():
+    rl = _rate_limit()
+    if rl:
+        return rl
     sector = request.args.get("sector", "").strip()
     if not sector:
         return jsonify({"error": "No sector provided", "available": list(US_SECTORS.keys())}), 400
@@ -3496,8 +3830,8 @@ def us_sector_route():
         resp.headers["Cache-Control"] = "no-store"
         return resp
     except Exception as e:
-        import traceback
-        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
+        log.exception("/api/us/sector failed for sector=%s", sector)
+        return jsonify({"error": "Sector analysis failed."}), 500
 
 
 @app.route("/api/us/sectors")

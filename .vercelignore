@@ -5,3 +5,6 @@ __pycache__
 stderr.txt
 stdout.txt
 users.json
+users.example.json
+requirements_web.txt
+README.md
