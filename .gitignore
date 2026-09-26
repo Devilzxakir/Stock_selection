@@ -1,14 +1,20 @@
 # Sensitive data
 users.json
 .env
+.env.*
+*.env
 
 # Python
 __pycache__/
+api/__pycache__/
 *.pyc
 *.pyo
 *.egg-info/
 dist/
 build/
+venv/
+.venv/
+env/
 
 # IDE
 .vscode/
@@ -24,3 +30,6 @@ Thumbs.db
 *.log
 stderr.txt
 stdout.txt
+
+# Uploads (user data - never commit)
+uploads/

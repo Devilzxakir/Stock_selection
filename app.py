@@ -111,7 +111,7 @@ if not SESSION_ID:
         log.warning("SESSION_ID env var not set on Vercel — Screener scraping will fail.")
         SESSION_ID = ""
     else:
-        SESSION_ID = "wd45cahfg2g5q6tqyabmkfw7zjih1bbb"
+        SESSION_ID = "emwyq7ua7o7py5vl12cdhkkmpgwuu2gr"
 
 BASE    = "https://www.screener.in"
 HEADERS = {
@@ -2040,7 +2040,10 @@ def twenty_point_checklist(analyze_result):
 
 
 def buy_confirmation_gate(twenty_point, red_flags_data, val_info, overall_score):
-    """Final gate that must be passed before recommending a buy."""
+    """Final gate that must be passed before recommending a buy.
+
+    STRicter thresholds — most stocks should NOT get a green light.
+    """
     gate = {
         "buy_signal": False,
         "reasons_to_buy": [],
@@ -2049,52 +2052,63 @@ def buy_confirmation_gate(twenty_point, red_flags_data, val_info, overall_score)
         "required_checks": [],
     }
 
-    # Check 1: Pass rate >= 60%
+    # Check 1: Pass rate >= 70% (raised from 60%)
     pass_rate = twenty_point["summary"]["pass_rate"]
-    if pass_rate >= 60:
-        gate["reasons_to_buy"].append(f"✅ {pass_rate:.0f}% of 20-point criteria passed")
+    if pass_rate >= 70:
+        gate["reasons_to_buy"].append(f"✅ {pass_rate:.0f}% of 20-point criteria passed (≥70%)")
     else:
-        gate["reasons_to_avoid"].append(f"❌ Only {pass_rate:.0f}% of criteria passed (need ≥60%)")
+        gate["reasons_to_avoid"].append(f"❌ Only {pass_rate:.0f}% of criteria passed (need ≥70%)")
 
     # Check 2: No critical red flags
     red_flags = red_flags_data.get("red_flags", [])
     critical_red_flags = [f for f in red_flags if f.get("severity") == "critical"]
-    if len(critical_red_flags) == 0:
+    high_red_flags = [f for f in red_flags if f.get("severity") == "high"]
+    if len(critical_red_flags) == 0 and len(high_red_flags) <= 1:
         gate["reasons_to_buy"].append("✅ No critical red flags detected")
-    else:
+    elif len(critical_red_flags) > 0:
         gate["reasons_to_avoid"].append(f"❌ {len(critical_red_flags)} critical red flag(s) — safety concern")
-
-    # Check 3: Undervalued or fairly valued
-    upside = val_info.get("upside_pct") if val_info else None
-    if upside is not None and upside >= 0:
-        gate["reasons_to_buy"].append(f"✅ Upside potential of {upside:+.1f}%")
-    elif upside is not None and upside < 0:
-        gate["reasons_to_avoid"].append(f"❌ Stock is overvalued (upside: {upside:+.1f}%)")
     else:
-        gate["reasons_to_avoid"].append("❌ Valuation data insufficient")
+        gate["reasons_to_avoid"].append(f"❌ {len(high_red_flags)} high-severity red flag(s)")
 
-    # Check 4: Overall score >= 6
-    if overall_score >= 6:
-        gate["reasons_to_buy"].append(f"✅ Fundamentals score {overall_score}/10")
+    # Check 3: Meaningfully undervalued (upside >= 10%, not just >= 0%)
+    upside = val_info.get("upside_pct") if val_info else None
+    if upside is not None and upside >= 10:
+        gate["reasons_to_buy"].append(f"✅ Meaningfully undervalued (upside: {upside:+.1f}%)")
+    elif upside is not None and upside >= 0:
+        gate["reasons_to_buy"].append(f"✅ Fairly valued (upside: {upside:+.1f}%)")
+    elif upside is not None and upside >= -15:
+        gate["reasons_to_avoid"].append(f"❌ Overvalued (upside: {upside:+.1f}%)")
+    else:
+        gate["reasons_to_avoid"].append("❌ Significantly overvalued or no valuation data")
+
+    # Check 4: Strong fundamentals (score >= 7, raised from 6)
+    if overall_score >= 7:
+        gate["reasons_to_buy"].append(f"✅ Strong fundamentals score {overall_score}/10")
+    elif overall_score >= 5.5:
+        gate["reasons_to_avoid"].append(f"⚠️ Moderate fundamentals ({overall_score}/10 — need ≥7)")
     else:
         gate["reasons_to_avoid"].append(f"❌ Weak fundamentals ({overall_score}/10)")
 
-    # Check 5: Revenue growing
-    # Check 6: Profit growing (implied in overall score)
+    # Check 5: Weighted pass rate >= 65% (new discriminating check)
+    weighted_rate = twenty_point["summary"].get("weighted_pass_rate", 0)
+    if weighted_rate >= 65:
+        gate["reasons_to_buy"].append(f"✅ Weighted pass rate {weighted_rate:.0f}% (≥65%)")
+    else:
+        gate["reasons_to_avoid"].append(f"❌ Weighted pass rate only {weighted_rate:.0f}% (need ≥65%)")
 
-    # Final verdict
+    # Final verdict — strict thresholds
     buy_count = len(gate["reasons_to_buy"])
     avoid_count = len(gate["reasons_to_avoid"])
 
     gate["required_checks"] = {
-        i+1: r.replace('✅ ', '').replace('❌ ', '')
+        i+1: r.replace('✅ ', '').replace('❌ ', '').replace('⚠️ ', '')
         for i, r in enumerate(gate["reasons_to_buy"] + gate["reasons_to_avoid"])
     }
 
-    if buy_count >= 3 and avoid_count == 0:
+    if buy_count >= 4 and avoid_count == 0:
         gate["buy_signal"] = True
         gate["final_verdict"] = "✅ GREEN LIGHT — All major checks passed. Good to buy."
-    elif buy_count >= 2 and avoid_count <= 1:
+    elif buy_count >= 3 and avoid_count <= 1:
         gate["buy_signal"] = True
         gate["final_verdict"] = "🟡 CONDITIONAL BUY — Most checks passed. Buy with position sizing."
     elif avoid_count >= 3:
@@ -2451,6 +2465,179 @@ def series_list_us(s, n=12):
     if not s: return []
     ks = list(s.keys())[-n:]
     return [{"year": k, "value": s[k], "formatted": _fmt_usd(s[k])} for k in ks]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSENSUS VERDICT ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+# Problem: Five independent verdict sources (entry_zones, overall_investor_score,
+# overall_signal, score-threshold verdict, buy_confirmation_gate) each use
+# different thresholds and inputs, producing contradictory signals for the same
+# stock. The UI currently presents them as equal independent claims.
+#
+# Solution: Majority-vote + weighted-average hybrid. Each sub-verdict is
+# normalized to a 5-point scale (5=STRONG BUY … 1=AVOID), then:
+#   1. A weighted average produces a continuous score → mapped back to a label.
+#   2. Simple majority vote confirms the consensus label.
+#   3. Agreement count is tracked ("3 agree / 2 disagree").
+#
+# Weights reflect each model's analytical scope and discriminating power:
+#   - entry_zones (0.20): Valuation — most discriminating, uses upside %.
+#   - overall_investor_score (0.25): 5-investor-framework composite — broad but bullish-skewed.
+#   - overall_signal (0.20): Multi-factor aggregator (fundamentals+valuation+risk).
+#   - score_threshold_verdict (0.15): Raw financials scoring — useful baseline.
+#   - buy_confirmation_gate (0.20): Risk-adjusted gate — important check, but was
+#     overweighted causing every stock to get BUY. Balanced with entry_zones.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Normalized mapping: verdict text → numeric score (1–5)
+# Both base forms and full forms (with emoji prefixes) are mapped.
+# The _normalize_verdict() function also does prefix matching as fallback.
+_VERDICT_MAP = {
+    # 5 = STRONG BUY
+    "STRONG BUY": 5,
+    "STRONG BUY — EXCEPTIONAL ACROSS ALL FRAMEWORKS": 5,
+    "STRONG BUY — DEEP VALUE": 5,
+    "GREEN LIGHT — ALL MAJOR CHECKS PASSED. GOOD TO BUY.": 5,
+    "✅ GREEN LIGHT — ALL MAJOR CHECKS PASSED. GOOD TO BUY.": 5,
+    # 4 = BUY
+    "BUY": 4,
+    "BUY — GOOD ALIGNMENT WITH MULTIPLE STRATEGIES": 4,
+    "BUY — GOOD MARGIN OF SAFETY": 4,
+    "ACCUMULATE": 4,
+    "CONDITIONAL BUY — MOST CHECKS PASSED. BUY WITH POSITION SIZING.": 4,
+    "🟡 CONDITIONAL BUY — MOST CHECKS PASSED. BUY WITH POSITION SIZING.": 4,
+    # 3 = HOLD / WAIT
+    "HOLD": 3,
+    "HOLD — MIXED SIGNALS ACROSS FRAMEWORKS": 3,
+    "HOLD — NEAR FAIR VALUE": 3,
+    "WAIT & WATCH": 3,
+    "WAIT — MIXED SIGNALS. WAIT FOR BETTER CLARITY.": 3,
+    "🟠 WAIT — MIXED SIGNALS. WAIT FOR BETTER CLARITY.": 3,
+    # 2 = CAUTION
+    "CAUTION": 2,
+    "CAUTION — MOST FRAMEWORKS DISAGREE": 2,
+    "CAUTIOUS — SLIGHTLY OVERVALUED": 2,
+    # 1 = AVOID / SELL
+    "AVOID": 1,
+    "AVOID — CONSISTENTLY POOR ACROSS ALL FRAMEWORKS": 1,
+    "AVOID — SIGNIFICANTLY OVERVALUED, WAIT FOR CORRECTION": 1,
+    "SELL / AVOID": 1,
+    "RED LIGHT — MULTIPLE REASONS TO AVOID. DO NOT BUY.": 1,
+    "🔴 RED LIGHT — MULTIPLE REASONS TO AVOID. DO NOT BUY.": 1,
+}
+
+# Weight per source (must sum to 1.0)
+_SOURCE_WEIGHTS = {
+    "entry_zones":          0.20,   # Valuation — most discriminating (upside %)
+    "investor_frameworks":  0.25,   # 5-framework composite — broad, slightly bullish bias
+    "overall_signal":       0.20,   # Multi-factor aggregator
+    "score_verdict":        0.15,   # Raw financials baseline
+    "buy_gate":             0.20,   # Risk gate — important but was overweight
+}
+
+def _normalize_verdict(text):
+    """Map any verdict string to a 1–5 numeric score."""
+    if text is None:
+        return None
+    upper = text.strip().upper()
+    # Direct lookup
+    if upper in _VERDICT_MAP:
+        return _VERDICT_MAP[upper]
+    # Prefix match (e.g. "BUY — ..." maps to BUY=4)
+    for key, val in _VERDICT_MAP.items():
+        if upper.startswith(key.split("—")[0].strip()):
+            return val
+    return None  # unrecognized
+
+_LABEL_FROM_SCORE = {
+    5: "STRONG BUY", 4: "BUY", 3: "HOLD", 2: "CAUTION", 1: "AVOID"
+}
+
+def consensus_verdict(entry_zones_rec, investor_verdict, overall_signal_label,
+                      score_verdict_text, buy_gate_text):
+    """Combine all 5 sub-verdicts into one consensus recommendation.
+
+    Returns dict with keys:
+      verdict     — consensus label (STRONG BUY / BUY / HOLD / CAUTION / AVOID)
+      score       — weighted average score (1.0–5.0)
+      agreement   — number of sub-verdicts matching consensus label
+      total       — number of sub-verdicts that produced a valid score
+      agree_count — how many agree
+      disagree_count — how many disagree
+      sub_verdicts — list of {source, raw, score, agrees_with_consensus}
+    """
+    sources = [
+        ("Valuation Entry Zones",  entry_zones_rec,    _SOURCE_WEIGHTS["entry_zones"]),
+        ("Investor Frameworks",    investor_verdict,    _SOURCE_WEIGHTS["investor_frameworks"]),
+        ("Multi-Factor Signal",    overall_signal_label,_SOURCE_WEIGHTS["overall_signal"]),
+        ("Financials Score",       score_verdict_text,  _SOURCE_WEIGHTS["score_verdict"]),
+        ("Buy Confirmation Gate",  buy_gate_text,       _SOURCE_WEIGHTS["buy_gate"]),
+    ]
+
+    sub_verdicts = []
+    weighted_sum = 0
+    total_weight = 0
+
+    for name, raw_text, weight in sources:
+        score = _normalize_verdict(raw_text)
+        sub_verdicts.append({
+            "source": name,
+            "raw": raw_text or "N/A",
+            "score": score,
+            "agrees_with_consensus": None,  # filled after consensus
+            "weight": weight,
+        })
+        if score is not None:
+            weighted_sum += score * weight
+            total_weight += weight
+
+    if total_weight == 0:
+        return {
+            "verdict": "INSUFFICIENT DATA",
+            "score": 0,
+            "agreement": 0, "total": 0,
+            "agree_count": 0, "disagree_count": 0,
+            "sub_verdicts": sub_verdicts,
+        }
+
+    avg_score = weighted_sum / total_weight
+    # Round to nearest integer label
+    consensus_int = max(1, min(5, round(avg_score)))
+    consensus_label = _LABEL_FROM_SCORE[consensus_int]
+
+    # Count agreement — a sub-verdict "agrees" if its score is within ±1
+    # of the consensus (e.g. BUY=4 agrees with STRONG BUY=5, HOLD=3, and BUY=4).
+    # Averge scores at the same tier boundary (e.g. 3.5 rounds to 4=BUY but 3.4
+    # rounds to 3=HOLD) are inherently close, so ±1 captures real consensus.
+    agree = 0
+    disagree = 0
+    for sv in sub_verdicts:
+        if sv["score"] is not None:
+            if abs(sv["score"] - consensus_int) <= 1:
+                agree += 1
+                sv["agrees_with_consensus"] = True
+            else:
+                disagree += 1
+                sv["agrees_with_consensus"] = False
+
+    # Compute a CSS class for styling
+    if consensus_int >= 5:   cls = "strong-buy"
+    elif consensus_int >= 4: cls = "buy"
+    elif consensus_int >= 3: cls = "hold"
+    elif consensus_int >= 2: cls = "caution"
+    else:                    cls = "avoid"
+
+    return {
+        "verdict": consensus_label,
+        "score": round(avg_score, 2),
+        "agreement": agree,
+        "total": len(sub_verdicts),
+        "agree_count": agree,
+        "disagree_count": disagree,
+        "cls": cls,
+        "sub_verdicts": sub_verdicts,
+    }
+
 
 def analyze_full(company_name, slug, sheets, biz_info, yahoo_data=None):
     """Comprehensive analysis returning all sections including 10 advanced features."""
@@ -3041,6 +3228,21 @@ def analyze_full(company_name, slug, sheets, biz_info, yahoo_data=None):
         "frameworks": framework_results,
         "overall": fw_overall,
     }
+
+    # ── CONSENSUS VERDICT: Combine all 5 sub-verdicts ──
+    entry_zones_rec = zones.get("recommendation") if zones else None
+    investor_verdict = fw_overall.get("verdict") if fw_overall else None
+    overall_sig_label = osig.get("label") if osig else None
+    # Score-threshold verdict is already in `verdict` variable (line ~2797)
+    buy_gate_text = buy_gate.get("final_verdict") if buy_gate else None
+
+    result["consensus"] = consensus_verdict(
+        entry_zones_rec=entry_zones_rec,
+        investor_verdict=investor_verdict,
+        overall_signal_label=overall_sig_label,
+        score_verdict_text=verdict,
+        buy_gate_text=buy_gate_text,
+    )
 
     return result
 
@@ -3687,6 +3889,19 @@ def analyze_us_stock(ticker):
     result["management_quality"] = assess_management_quality(
         None, "Reducing" if debt_reduced else "Increasing",
         latest_roce_v, latest_roe_v
+    )
+
+    # ── CONSENSUS VERDICT for US stocks ──
+    entry_zones_rec = zones.get("recommendation") if zones else None
+    investor_verdict = fw_overall.get("verdict") if fw_overall else None
+    overall_sig_label = osig.get("label") if osig else None
+    buy_gate_text = buy_gate.get("final_verdict") if buy_gate else None
+    result["consensus"] = consensus_verdict(
+        entry_zones_rec=entry_zones_rec,
+        investor_verdict=investor_verdict,
+        overall_signal_label=overall_sig_label,
+        score_verdict_text=verdict,
+        buy_gate_text=buy_gate_text,
     )
 
     return result
