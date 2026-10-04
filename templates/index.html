@@ -33,6 +33,7 @@
     --radius-sm: 10px;
     --radius-xs: 8px;
     --max-w:     980px;
+    --spin-ring-color: #53140E;
   }
 
   html[data-theme="dark"] {
@@ -52,6 +53,7 @@
     --shadow-sm: 0 1px 3px rgba(0,0,0,0.2);
     --shadow-md: 0 4px 16px rgba(0,0,0,0.3);
     --shadow-lg: 0 12px 40px rgba(0,0,0,0.4);
+    --spin-ring-color: #BDBDBD;
   }
 
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -264,6 +266,25 @@
   }
   @keyframes spin { to { transform: rotate(360deg); } }
   .loader-text { color: var(--text-tertiary); font-size: 13px; }
+
+  /* ── ANALYZE BUTTON LOADER ── */
+  .analyze-btn { position: relative; overflow: hidden; }
+  .analyze-btn.loading .btn-text { display: none; }
+  .analyze-btn.loading .btn-loader { display: inline-flex; align-items: center; gap: 8px; }
+  .spin-mini {
+    width: 20px; height: 20px;
+    border: 3px solid var(--spin-ring-color, var(--border));
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite, pulse-ring 1.5s ease-in-out infinite;
+  }
+  @keyframes pulse-ring {
+    0%, 100% { transform: rotate(0deg) scale(1); opacity: 1; }
+    50% { transform: rotate(180deg) scale(1.1); opacity: 0.8; }
+  }
+  .btn-loader { display: none; font-size: 13px; font-weight: 600; color: var(--accent); }
+  .analyze-btn.loading { background: linear-gradient(90deg, var(--accent) 0%, var(--blue) 100%); box-shadow: 0 0 20px rgba(0,113,227,0.4); }
+  .analyze-btn.loading .btn-loader { color: #fff; }
 
   /* ── SKELETON ── */
   #skeleton { display: none; max-width: var(--max-w); margin: 0 auto; padding: 40px 24px 80px; }
@@ -874,12 +895,12 @@
 <div class="search-wrap">
   <div class="search-box">
     <input id="searchInput" type="text" placeholder="Search company (e.g. Emmvee, Reliance, TCS...)" autocomplete="off">
-    <button id="searchBtn">ANALYZE →</button>
+    <button id="searchBtn" class="analyze-btn"><span class="btn-text">ANALYZE →</span><span class="btn-loader" style="display:none;"><span class="spin-mini"></span>Analyzing...</span></button>
   </div>
-  <div id="dropdown"></div>
-</div>
+<div id="dropdown"></div>
+  </div>
 
-<!-- EXCEL UPLOAD OPTION (India only) -->
+  <!-- EXCEL UPLOAD OPTION (India only) -->
 <div id="indiaUpload" class="upload-section">
   <div class="upload-or">— or —</div>
   <label class="upload-label">
@@ -1057,69 +1078,91 @@ excelUpload.addEventListener('change', async (e) => {
 });
 
 // ── SEARCH DEBOUNCE ──
-input.addEventListener('input', () => {
-  clearTimeout(searchTimer);
-  selectedSlug = null;
-  selectedName = null;
-  selectedTicker = null;
-  const q = input.value.trim();
-  if (!q) { showSearchHistory(); return; }
-  searchTimer = setTimeout(() => {
-    if (currentMarket === 'us') fetchSuggestionsUS(q);
-    else fetchSuggestions(q);
-  }, 300);
-});
-
-input.addEventListener('focus', () => {
-  if (!input.value.trim()) showSearchHistory();
-});
-
-async function fetchSuggestions(q) {
-  const res  = await fetch(`/api/search?q=${encodeURIComponent(q)}&_=${Date.now()}`);
-  const data = await res.json();
-  if (!data.length) { dropdown.style.display = 'none'; return; }
-  dropdown.innerHTML = data.map(c => `
-    <div class="drop-item" data-slug="${escHtml(c.url.split('/').filter(Boolean)[1])}" data-name="${escHtml(c.name)}" data-url="${escHtml(c.url)}">
-      <div>
-        <div class="drop-name">${escHtml(c.name)}</div>
-        <div class="drop-url">${escHtml(c.url)}</div>
-      </div>
-    </div>`).join('');
-  dropdown.style.display = 'block';
-  dropdown.querySelectorAll('.drop-item').forEach(el => {
-    el.addEventListener('click', () => {
-      const slug = el.dataset.slug;
-      selectedSlug = slug;
-      selectedName = el.dataset.name;
-      input.value  = el.dataset.name;
-      dropdown.style.display = 'none';
-      runAnalysis();
-    });
+  input.addEventListener('input', () => {
+    clearTimeout(searchTimer);
+    selectedSlug = null;
+    selectedName = null;
+    selectedTicker = null;
+    const q = input.value.trim();
+    if (!q) { showSearchHistory(); return; }
+    searchTimer = setTimeout(() => {
+      if (currentMarket === 'us') fetchSuggestionsUS(q);
+      else fetchSuggestions(q);
+    }, 300);
   });
-}
+
+  input.addEventListener('focus', () => {
+    if (!input.value.trim()) showSearchHistory();
+  });
+
+  async function fetchSuggestions(q) {
+    try {
+      const res  = await fetch(`/api/search?q=${encodeURIComponent(q)}&_=${Date.now()}`);
+      const data = await res.json();
+      if (!data || !data.length) { dropdown.style.display = 'none'; return; }
+      dropdown.innerHTML = data.map(c => `
+        <div class="drop-item" data-slug="${escHtml(c.url.split('/').filter(Boolean)[1])}" data-name="${escHtml(c.name)}" data-url="${escHtml(c.url)}">
+          <div>
+            <div class="drop-name">${escHtml(c.name)}</div>
+            <div class="drop-url">${escHtml(c.url)}</div>
+          </div>
+        </div>`).join('');
+      dropdown.style.display = 'block';
+      dropdown.querySelectorAll('.drop-item').forEach(el => {
+        // Use mousedown to ensure it fires before document click closes dropdown
+        el.addEventListener('mousedown', (e) => {
+          e.preventDefault(); // Prevent focus loss
+          const slug = el.dataset.slug;
+          selectedSlug = slug.toLowerCase();
+          selectedName = el.dataset.name;
+          input.value  = el.dataset.name;
+          dropdown.style.display = 'none';
+        });
+        // Also keep click as fallback
+        el.addEventListener('click', (e) => {
+          e.stopPropagation();
+        });
+      });
+    } catch (err) {
+      dropdown.style.display = 'none';
+      console.warn('Search suggestions failed:', err);
+    }
+  }
 
 // ── SEARCH BUTTON ──
-searchBtn.addEventListener('click', () => {
-  if (currentMarket === 'us') {
-    if (selectedTicker) { runAnalysisUS(); return; }
-    const q = input.value.trim().toUpperCase().replace(/.*\(([^)]+)\)/, '$1').trim();
+  searchBtn.addEventListener('click', async () => {
+    if (currentMarket === 'us') {
+      if (selectedTicker) { runAnalysisUS(); return; }
+      const q = input.value.trim().toUpperCase().replace(/.*\(([^)]+)\)/, '$1').trim();
+      if (!q) return;
+      // Direct ticker search
+      selectedTicker = q;
+      selectedSlug = q;
+      selectedName = q;
+      runAnalysisUS();
+      return;
+    }
+    if (selectedSlug) { runAnalysis(); return; }
+    // try direct slug from input - fetch suggestions and pick first
+    const q = input.value.trim();
     if (!q) return;
-    // Direct ticker search
-    selectedTicker = q;
-    selectedSlug = q;
-    selectedName = q;
-    runAnalysisUS();
-    return;
-  }
-  if (selectedSlug) { runAnalysis(); return; }
-  // try direct slug from input
-  const q = input.value.trim();
-  if (!q) return;
-  fetchSuggestions(q).then(() => {
-    const first = dropdown.querySelector('.drop-item');
-    if (first) first.click();
+    try {
+      await fetchSuggestions(q);
+      const first = dropdown.querySelector('.drop-item');
+      if (first) first.click();
+      else {
+        // If no suggestions, try using input as slug directly
+        selectedSlug = q.toLowerCase().replace(/\s+/g, '-');
+        selectedName = q;
+        runAnalysis();
+      }
+    } catch (err) {
+      // Fallback: use input as slug directly
+      selectedSlug = q.toLowerCase().replace(/\s+/g, '-');
+      selectedName = q;
+      runAnalysis();
+    }
   });
-});
 
 input.addEventListener('keydown', e => {
   if (e.key === 'Enter') searchBtn.click();
@@ -1148,16 +1191,17 @@ function showSearchHistory() {
   dd.innerHTML = `<div style="padding:6px 14px 2px;font-size:10px;color:var(--text-secondary);letter-spacing:.1em;text-transform:uppercase;border-bottom:1px solid var(--border)">Recent</div>` +
     h.map(s => `<div class="drop-item" data-slug="${escHtml(s.slug)}" data-name="${escHtml(s.name)}"><span class="drop-name">${escHtml(s.name)}</span></div>`).join('');
   dd.style.display = 'block';
-  dd.querySelectorAll('.drop-item').forEach(el => {
-    el.addEventListener('click', () => {
-      selectedSlug = el.dataset.slug;
-      selectedName = el.dataset.name;
-      input.value = el.dataset.name;
-      dd.style.display = 'none';
-      if (currentMarket === 'us') { selectedTicker = el.dataset.slug; runAnalysisUS(); }
-      else runAnalysis();
+dd.querySelectorAll('.drop-item').forEach(el => {
+      el.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        selectedSlug = el.dataset.slug.toLowerCase();
+        selectedName = el.dataset.name;
+        dd.style.display = 'none';
+        if (currentMarket === 'us') { selectedTicker = el.dataset.slug; }
+        input.value = el.dataset.name;
+      });
+      el.addEventListener('click', (e) => e.stopPropagation());
     });
-  });
 }
 
 // ── MARKET SWITCH ──
@@ -1189,29 +1233,39 @@ function switchMarket(market) {
 }
 
 // ── US STOCK SEARCH ──
-async function fetchSuggestionsUS(q) {
-  const res  = await fetch(`/api/us/search?q=${encodeURIComponent(q)}&_=${Date.now()}`);
-  const data = await res.json();
-  if (!data || !data.length) { dropdown.style.display = 'none'; return; }
-  dropdown.innerHTML = data.map(c => `
-    <div class="drop-item" data-ticker="${escHtml(c.ticker)}" data-name="${escHtml(c.name)}" data-sector="${escHtml(c.sector || '')}">
-      <div>
-        <div class="drop-name">${escHtml(c.name)} <span style="font-size:10px;color:var(--text-secondary);font-family:'JetBrains Mono',monospace">${escHtml(c.ticker)}</span></div>
-        <div class="drop-url">${escHtml(c.sector || '')} ${c.exchange ? '· ' + escHtml(c.exchange) : ''} ${c.price ? '· $' + escHtml(c.price) : ''}</div>
-      </div>
-    </div>`).join('');
-  dropdown.style.display = 'block';
-  dropdown.querySelectorAll('.drop-item').forEach(el => {
-    el.addEventListener('click', () => {
-      selectedTicker = el.dataset.ticker;
-      selectedName = el.dataset.name;
-      selectedSlug = el.dataset.ticker;
-      input.value = `${el.dataset.name} (${el.dataset.ticker})`;
+  async function fetchSuggestionsUS(q) {
+    try {
+      const res  = await fetch(`/api/us/search?q=${encodeURIComponent(q)}&_=${Date.now()}`);
+      const data = await res.json();
+      if (!data || !data.length) { dropdown.style.display = 'none'; return; }
+      dropdown.innerHTML = data.map(c => `
+        <div class="drop-item" data-ticker="${escHtml(c.ticker)}" data-name="${escHtml(c.name)}" data-sector="${escHtml(c.sector || '')}">
+          <div>
+            <div class="drop-name">${escHtml(c.name)} <span style="font-size:10px;color:var(--text-secondary);font-family:'JetBrains Mono',monospace">${escHtml(c.ticker)}</span></div>
+            <div class="drop-url">${escHtml(c.sector || '')} ${c.exchange ? '· ' + escHtml(c.exchange) : ''} ${c.price ? '· $' + escHtml(c.price) : ''}</div>
+          </div>
+        </div>`).join('');
+      dropdown.style.display = 'block';
+      dropdown.querySelectorAll('.drop-item').forEach(el => {
+        // Use mousedown to ensure it fires before document click closes dropdown
+        el.addEventListener('mousedown', (e) => {
+          e.preventDefault(); // Prevent focus loss
+          selectedTicker = el.dataset.ticker;
+          selectedName = el.dataset.name;
+          selectedSlug = el.dataset.ticker;
+          input.value = `${el.dataset.name} (${el.dataset.ticker})`;
+          dropdown.style.display = 'none';
+        });
+        // Also keep click as fallback
+        el.addEventListener('click', (e) => {
+          e.stopPropagation();
+        });
+      });
+    } catch (err) {
       dropdown.style.display = 'none';
-      runAnalysisUS();
-    });
-  });
-}
+      console.warn('US search suggestions failed:', err);
+    }
+  }
 
 async function runAnalysisUS() {
   if (!selectedTicker) return;
@@ -1222,9 +1276,13 @@ async function runAnalysisUS() {
   dropdown.style.display = 'none';
   clearInterval(liveTimer);
   animateLoadSteps();
+  // Show button loading state
+  const analyzeBtn = document.getElementById('searchBtn');
+  if (analyzeBtn) analyzeBtn.classList.add('loading');
 
   try {
-    const res  = await fetch(`/api/us/analyze?ticker=${encodeURIComponent(selectedTicker)}&_=${Date.now()}`);
+    const url = `/api/us/analyze?ticker=${encodeURIComponent(selectedTicker)}&_=${Date.now()}`;
+    const res  = await fetch(url);
     const data = await res.json();
     if (data.error) throw new Error(data.error);
     resetLoadSteps();
@@ -1232,12 +1290,16 @@ async function runAnalysisUS() {
     skeleton.style.display = 'none';
     results.style.display = 'block';
     renderResults(data);
+    // Scroll to results section like consensus verdict
+    results.scrollIntoView({ behavior: 'smooth', block: 'start' });
   } catch(err) {
     resetLoadSteps();
-    loader.style.display = 'none';
-    skeleton.style.display = 'none';
+    loader.style.display  = 'none';
+    skeleton.style.display  = 'none';
     errorBox.style.display = 'block';
-    errorBox.textContent = err.message;
+    errorBox.textContent   = err.message;
+  } finally {
+    if (analyzeBtn) analyzeBtn.classList.remove('loading');
   }
 }
 
@@ -1271,6 +1333,8 @@ async function analyzeSector(sector) {
     resultsDiv.innerHTML = `<div style="color:var(--red)">Error: ${escHtml(e.message)}</div>`;
     resultsDiv.style.display = 'block';
   }
+  // Ensure search input still works after sector analysis
+  input.focus();
 }
 
 function renderSectorResults(data, el) {
@@ -1340,8 +1404,8 @@ function animateLoadSteps() {
     if (i > 0) steps[i-1].classList.remove('active'), steps[i-1].classList.add('done');
     if (i < steps.length) { steps[i].classList.add('active'); i++; }
     else clearInterval(_loadStepTimer);
-  }, 2500);
-}
+}, 2500);
+  }
 function resetLoadSteps() {
   clearInterval(_loadStepTimer);
   document.querySelectorAll('.loading-step').forEach(s => {
@@ -1361,9 +1425,13 @@ async function runAnalysis() {
   dropdown.style.display = 'none';
   clearInterval(liveTimer);
   animateLoadSteps();
+  // Show button loading state
+  const analyzeBtn = document.getElementById('searchBtn');
+  if (analyzeBtn) analyzeBtn.classList.add('loading');
 
   try {
-    const res  = await fetch(`/api/analyze?slug=${encodeURIComponent(selectedSlug)}&name=${encodeURIComponent(selectedName)}&_=${Date.now()}`);
+    const url = `/api/analyze?slug=${encodeURIComponent(selectedSlug)}&name=${encodeURIComponent(selectedName)}&_=${Date.now()}`;
+    const res  = await fetch(url);
     const data = await res.json();
     if (data.error) throw new Error(data.error);
     resetLoadSteps();
@@ -1371,15 +1439,20 @@ async function runAnalysis() {
     skeleton.style.display = 'none';
     results.style.display = 'block';
     renderResults(data);
+    // Scroll to results section like consensus verdict
+    results.scrollIntoView({ behavior: 'smooth', block: 'start' });
     // Start live price polling
     fetchLivePrice();
     liveTimer = setInterval(fetchLivePrice, 30000);
   } catch(err) {
+    console.error('[runAnalysis] error:', err);
     resetLoadSteps();
     loader.style.display  = 'none';
     skeleton.style.display  = 'none';
     errorBox.style.display = 'block';
     errorBox.textContent   = err.message;
+  } finally {
+    if (analyzeBtn) analyzeBtn.classList.remove('loading');
   }
 }
 
@@ -1470,20 +1543,21 @@ function renderSeries(series, label) {
 }
 
 function renderResults(A) {
-  _curAnalysis = A;
-  const m   = A.metrics;
-  const val = A.val;
-  const s   = A.series;
-  const b   = A.business || {};
-  const r   = A.ratios || {};
-  const bs  = A.balance_sheet || {};
-  const cf  = A.cash_flow || {};
-  const gr  = A.growth || {};
-  const lt  = A.long_term || {};
-  const chk = A.checklist || {};
-  const fm  = A.formulas || {};
-  formulaData = fm;
-  checklistData = (A.twenty_point_checklist && A.twenty_point_checklist.checklist) || [];
+  try {
+    _curAnalysis = A;
+    const m   = A.metrics;
+    const val = A.val;
+    const s   = A.series;
+    const b   = A.business || {};
+    const r   = A.ratios || {};
+    const bs  = A.balance_sheet || {};
+    const cf  = A.cash_flow || {};
+    const gr  = A.growth || {};
+    const lt  = A.long_term || {};
+    const chk = A.checklist || {};
+    const fm  = A.formulas || {};
+    formulaData = fm;
+    checklistData = (A.twenty_point_checklist && A.twenty_point_checklist.checklist) || [];
 
   const isUS = A.market === 'US';
   const CUR = isUS ? '$' : '₹';
@@ -2341,6 +2415,15 @@ function renderResults(A) {
       </div>
     </div>
   `;
+    console.log('[renderResults] completed successfully');
+  } catch(err) {
+    console.log('[renderResults] error:', err);
+    errorBox.style.display = 'block';
+    errorBox.textContent = 'Render error: ' + err.message;
+    loader.style.display = 'none';
+    skeleton.style.display = 'none';
+    results.style.display = 'none';
+  }
 }
 
 function downloadPDF() {

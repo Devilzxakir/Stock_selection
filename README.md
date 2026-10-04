@@ -312,3 +312,7 @@ Made with ❤️ by [Devilzxakir](https://github.com/Devilzxakir)
 [🌐 Live App](https://stock-what-you-want.vercel.app/) · [🐛 Report Bug](https://github.com/Devilzxakir/Stock_selection/issues) · [💡 Request Feature](https://github.com/Devilzxakir/Stock_selection/issues)
 
 </div>
+
+
+
+
