@@ -7,6 +7,7 @@
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>S</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
   /* ══════════════════════════════════════════════════════════════
      STOCKSENSE — Apple-Style Clean Design System
@@ -1229,7 +1230,9 @@ function switchMarket(market) {
   document.getElementById('dropdown').innerHTML = '';
   _curAnalysis = null;
   clearInterval(liveTimer);
-  if (isUS) loadSectors();
+  if (isUS) {
+    loadSectors();
+  }
 }
 
 // ── US STOCK SEARCH ──
@@ -1281,7 +1284,7 @@ async function runAnalysisUS() {
   if (analyzeBtn) analyzeBtn.classList.add('loading');
 
   try {
-    const url = `/api/us/analyze?ticker=${encodeURIComponent(selectedTicker)}&_=${Date.now()}`;
+    const url = `/api/us/analyze?ticker=${encodeURIComponent(selectedTicker)}&mode=both&_=${Date.now()}`;
     const res  = await fetch(url);
     const data = await res.json();
     if (data.error) throw new Error(data.error);
@@ -1626,6 +1629,31 @@ function renderResults(A) {
     </div>
     `}
 
+    <!-- PROVIDER METADATA (US only) -->
+    ${isUS && A.provider_metadata ? `
+    <div class="section-label fade-in" style="margin-top:24px">Data Sources & Provenance</div>
+    <div class="card fade-in">
+      <div class="card-title">Provider Mode: ${escHtml(A.provider_mode || 'smart').toUpperCase()}</div>
+      <div style="font-size:11px;color:var(--text-secondary);margin-bottom:12px">Shows which provider supplied each data category. Smart mode uses Yahoo Finance first, falls back to others only when data is missing.</div>
+      <div class="metric-grid">
+        ${Object.entries(A.provider_metadata).map(([category, provider]) => `
+          <div class="metric-item">
+            <div class="metric-label">${escHtml(category.replace('_', ' ').replace(/([A-Z])/g, ' $1').trim())}</div>
+            <div class="metric-value" style="font-size:13px;${provider ? '' : 'color:var(--text-tertiary)'}">${escHtml(provider || 'unavailable')}</div>
+          </div>
+        `).join('')}
+      </div>
+      ${A.provider_discrepancies && Object.keys(A.provider_discrepancies).length > 0 ? `
+      <div style="margin-top:16px;padding:12px;background:rgba(255,149,0,0.08);border:1px solid rgba(255,149,0,0.2);border-radius:8px">
+        <div style="font-weight:600;color:var(--orange);margin-bottom:8px">⚠️ Data Discrepancies Detected</div>
+        ${Object.entries(A.provider_discrepancies).map(([metric, disc]) => `
+          <div style="font-size:11px;color:var(--text-secondary);font-family:'JetBrains Mono',monospace;margin:4px 0">
+            <strong>${escHtml(metric)}</strong>: Primary ${disc.primary !== undefined ? disc.primary : 'N/A'} vs ${disc.secondary_provider || 'Secondary'} ${disc.secondary !== undefined ? disc.secondary : 'N/A'} (diff: ${disc.diff_pct !== undefined ? disc.diff_pct + '%' : 'N/A'})
+          </div>
+        `).join('')}
+      </div>` : ''}
+    </div>` : ''}
+
     <!-- BUSINESS OVERVIEW -->
     <div class="section-label fade-in">Business Overview</div>
     <div style="font-size:11px;color:var(--text-secondary);margin-bottom:12px">What the company does, its industry, and who owns it.</div>
@@ -1958,6 +1986,18 @@ function renderResults(A) {
       </div>
       <div class="val-verdict-strip ${val.val_class}">${val.val_verdict}</div>
     </div>` : `<div class="card fade-in" style="color:var(--text-secondary);font-size:14px">Insufficient data for valuation. Need CMP, EPS, and BVPS in screener data.</div>`}
+
+    <!-- HISTORICAL P/E CHART (US stocks only) -->
+    ${isUS && A.historical_pe && A.historical_pe.data && A.historical_pe.data.length > 0 ? `
+    <div class="section-label fade-in">Historical P/E Ratio</div>
+    <div style="font-size:11px;color:var(--text-secondary);margin-bottom:12px">Quarterly P/E trend over the last ${Math.min(A.historical_pe.data.length, 20)} quarters. P/E = Quarter-end Price / TTM EPS. Hover for details.</div>
+    <div class="card fade-in">
+      <div class="card-title">Historical P/E Chart</div>
+      <div style="position:relative;height:320px">
+        <canvas id="historicalPeChart"></canvas>
+      </div>
+      <div id="peChartLegend" style="display:flex;gap:16px;justify-content:center;margin-top:12px;flex-wrap:wrap;font-size:11px;color:var(--text-secondary)"></div>
+    </div>` : ''}
 
     <!-- SCORE CARD -->
     <div class="section-label fade-in">Fundamentals Score Card</div>
@@ -2415,7 +2455,10 @@ function renderResults(A) {
       </div>
     </div>
   `;
-    console.log('[renderResults] completed successfully');
+    // Render historical P/E chart for US stocks
+    if (isUS && A.historical_pe && A.historical_pe.data && A.historical_pe.data.length > 0) {
+      setTimeout(() => renderHistoricalPeChart(A.historical_pe.data), 0);
+    }
   } catch(err) {
     console.log('[renderResults] error:', err);
     errorBox.style.display = 'block';
@@ -2424,6 +2467,129 @@ function renderResults(A) {
     skeleton.style.display = 'none';
     results.style.display = 'none';
   }
+}
+
+function renderHistoricalPeChart(peData) {
+  const ctx = document.getElementById('historicalPeChart');
+  const legendEl = document.getElementById('peChartLegend');
+  if (!ctx || !legendEl) return;
+
+  if (ctx.chart) {
+    ctx.chart.destroy();
+    ctx.chart = null;
+  }
+
+  const validData = peData.filter(d => d.pe !== null && d.pe !== undefined);
+  const naData = peData.filter(d => d.pe === null || d.pe === undefined);
+
+  if (validData.length === 0) {
+    ctx.parentElement.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-secondary);font-size:13px">No valid P/E data available (EPS may be zero or negative for all quarters)</div>';
+    return;
+  }
+
+  const labels = validData.map(d => d.quarter);
+  const peValues = validData.map(d => d.pe);
+  const minPe = Math.min(...peValues);
+  const maxPe = Math.max(...peValues);
+  const pad = Math.max((maxPe - minPe) * 0.15, 0.5);
+
+  const gradient = ctx.getContext('2d').createLinearGradient(0, 0, 0, 320);
+  gradient.addColorStop(0, 'rgba(0, 113, 227, 0.15)');
+  gradient.addColorStop(1, 'rgba(0, 113, 227, 0)');
+
+  ctx.chart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [{
+        label: 'P/E Ratio',
+        data: peValues,
+        borderColor: '#0071E3',
+        backgroundColor: gradient,
+        borderWidth: 2.5,
+        fill: true,
+        tension: 0.25,
+        pointRadius: 4,
+        pointHoverRadius: 6,
+        pointBackgroundColor: '#0071E3',
+        pointBorderColor: '#FFFFFF',
+        pointBorderWidth: 2,
+        pointStyle: 'circle',
+        spanGaps: false
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: {
+        mode: 'index',
+        intersect: false,
+      },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#1D1D1F',
+          titleColor: '#F5F5F7',
+          bodyColor: '#F5F5F7',
+          borderColor: 'rgba(255,255,255,0.1)',
+          borderWidth: 1,
+          padding: 12,
+          titleFont: { family: 'Inter', size: 13, weight: '600' },
+          bodyFont: { family: 'JetBrains Mono', size: 12 },
+          callbacks: {
+            label: function(context) {
+              const d = validData[context.dataIndex];
+              return [
+                'Quarter: ' + d.quarter,
+                'P/E Ratio: ' + d.pe.toFixed(2) + 'x',
+                'TTM EPS: ' + (d.eps !== undefined && d.eps !== null ? '$' + d.eps.toFixed(2) : 'N/A'),
+                'Price: ' + (d.price !== undefined && d.price !== null ? '$' + d.price.toFixed(2) : 'N/A'),
+                'Period End: ' + d.date
+              ];
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          grid: { display: false, drawBorder: false },
+          ticks: {
+            color: 'var(--text-tertiary)',
+            font: { family: 'Inter', size: 11 },
+            maxRotation: 0,
+            autoSkip: true,
+            maxTicksLimit: 12
+          }
+        },
+        y: {
+          grid: { color: 'var(--border-light)', drawBorder: false },
+          ticks: {
+            color: 'var(--text-tertiary)',
+            font: { family: 'JetBrains Mono', size: 11 },
+            callback: function(value) { return value + 'x'; },
+            min: Math.max(0, minPe - pad),
+            max: maxPe + pad
+          }
+        }
+      },
+      elements: { line: { capBezierPoints: true } }
+    }
+  });
+
+  const latest = validData[validData.length - 1];
+  const oldest = validData[0];
+  const change = oldest.pe !== 0 ? ((latest.pe - oldest.pe) / oldest.pe * 100) : 0;
+  const changeColor = change >= 0 ? 'var(--red)' : 'var(--green)';
+
+  legendEl.innerHTML =
+    '<span style="display:flex;align-items:center;gap:6px">' +
+      '<span style="width:12px;height:12px;border-radius:50%;background:#0071E3"></span>' +
+      '<span>P/E Ratio</span>' +
+    '</span>' +
+    '<span>Latest (' + latest.quarter + '): <strong>' + latest.pe.toFixed(2) + 'x</strong></span>' +
+    '<span>Oldest (' + oldest.quarter + '): <strong>' + oldest.pe.toFixed(2) + 'x</strong></span>' +
+    '<span style="color:' + changeColor + '">Change: ' + (change >= 0 ? '+' : '') + change.toFixed(1) + '%</span>' +
+    (naData.length > 0 ? '<span style="color:var(--orange)">&#9888; ' + naData.length + ' quarter(s) with N/A P/E (negative/zero EPS)</span>' : '');
 }
 
 function downloadPDF() {

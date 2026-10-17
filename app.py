@@ -6,9 +6,13 @@ Visit: http://localhost:5000
 
 import logging
 from flask import Flask, request, jsonify, render_template, send_file
+from werkzeug.middleware.proxy_fix import ProxyFix
 import requests as req
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import pandas as pd
 import math, re, os, io
+import threading
 import time
 from datetime import datetime, timedelta
 from io import BytesIO
@@ -30,7 +34,28 @@ logging.basicConfig(
 )
 log = logging.getLogger("stocksense")
 
+
+def _load_dotenv(path):
+    """Minimal dependency-free .env loader. Existing environment variables win."""
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+    except OSError:
+        pass
+
+
+_load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 
 # ── HARD LIMITS (production) ──────────────────────────────────────────────────
 MAX_UPLOAD_BYTES  = 10 * 1024 * 1024          # 10 MB cap on Excel upload
@@ -51,20 +76,33 @@ _LIVE_TTL      = timedelta(minutes=2)
 _RATE_BUCKET   = {}              # ip   -> [timestamps]
 _RATE_WINDOW   = 60              # seconds
 _RATE_MAX      = 30              # requests per window per IP
+_RATE_SWEEP    = 512             # prune stale IP buckets every N requests
+_RATE_CALLS    = 0
 
 def _rate_limit():
     """Per-IP fixed window limiter. Returns None if OK, or a 429 response."""
+    global _RATE_CALLS
     ip = request.headers.get("X-Forwarded-For", request.remote_addr or "anon").split(",")[0].strip()
     now = time.time()
-    bucket = _RATE_BUCKET.setdefault(ip, [])
     cutoff = now - _RATE_WINDOW
-    _RATE_BUCKET[ip] = [t for t in bucket if t > cutoff]
-    if len(_RATE_BUCKET[ip]) >= _RATE_MAX:
+    bucket = [t for t in _RATE_BUCKET.get(ip, []) if t > cutoff]
+    _RATE_CALLS += 1
+    if _RATE_CALLS % _RATE_SWEEP == 0:
+        # Periodically drop IPs whose window has fully expired so the dict
+        # cannot grow without bound in long-running processes.
+        for k in list(_RATE_BUCKET.keys()):
+            if k == ip:
+                continue
+            if not any(t > cutoff for t in _RATE_BUCKET[k]):
+                del _RATE_BUCKET[k]
+    if len(bucket) >= _RATE_MAX:
+        _RATE_BUCKET[ip] = bucket
         resp = jsonify({"error": "Too many requests. Please slow down."})
         resp.status_code = 429
         resp.headers["Retry-After"] = str(_RATE_WINDOW)
         return resp
-    _RATE_BUCKET[ip].append(now)
+    bucket.append(now)
+    _RATE_BUCKET[ip] = bucket
     return None
 
 # ── SECURITY HEADERS ──────────────────────────────────────────────────────────
@@ -74,6 +112,9 @@ def _security_headers(resp):
     resp.headers.setdefault("X-Frame-Options", "DENY")
     resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
     resp.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+    if request.is_secure or request.headers.get("X-Forwarded-Proto", "").lower() == "https" \
+            or os.environ.get("VERCEL"):
+        resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     if request.endpoint in (None, "index"):
         resp.headers.setdefault(
             "Content-Security-Policy",
@@ -81,8 +122,9 @@ def _security_headers(resp):
             "img-src 'self' data:; "
             "style-src 'self' https://fonts.googleapis.com 'unsafe-inline'; "
             "font-src https://fonts.gstatic.com; "
-            "connect-src 'self'; "
-            "script-src 'self' 'unsafe-inline'; "
+            "connect-src 'self' https://cdn.jsdelivr.net; "
+            "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+            "script-src-elem 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
             "frame-ancestors 'none'"
         )
     return resp
@@ -102,16 +144,13 @@ def _server_error(e):
     return jsonify({"error": "Internal server error"}), 500
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-# Screener.in session cookie. Required in production; falls back to a dev value
-# only when explicitly running locally.
-SESSION_ID = os.environ.get("SESSION_ID")
+# Screener.in session cookie. Required for live search; Excel upload works
+# without it. Never hardcode credentials — set SESSION_ID in the environment
+# or in a local .env file.
+SESSION_ID = os.environ.get("SESSION_ID", "").strip()
 if not SESSION_ID:
-    if os.environ.get("VERCEL"):
-        # Fail closed on Vercel if not configured
-        log.warning("SESSION_ID env var not set on Vercel — Screener scraping will fail.")
-        SESSION_ID = ""
-    else:
-        SESSION_ID = "emwyq7ua7o7py5vl12cdhkkmpgwuu2gr"
+    log.warning("SESSION_ID is not set — live Screener.in search will fail "
+                "(Excel upload still works). Set it in .env or the environment.")
 
 BASE    = "https://www.screener.in"
 HEADERS = {
@@ -120,6 +159,14 @@ HEADERS = {
     "Referer": "https://www.screener.in/",
 }
 COOKIES = {"sessionid": SESSION_ID} if SESSION_ID else {}
+
+# Shared HTTP session for Screener.in — connection pooling + transient retries.
+_HTTP = req.Session()
+_HTTP.headers.update(HEADERS)
+_retry = Retry(total=2, connect=2, read=2, backoff_factor=0.5,
+               status_forcelist=(500, 502, 503, 504), allowed_methods=("GET", "POST"))
+_HTTP.mount("https://", HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=_retry))
+_HTTP.mount("http://", HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=_retry))
 
 # ── Industry classification for 20-point framework ──
 GROWING_INDUSTRIES = [
@@ -133,6 +180,59 @@ STABLE_INDUSTRIES = [
     "fmcg", "consumer", "food", "beverage", "insurance", "power", "utility",
     "gas", "oil", "metal", "mining", "cement", "construction", "auto", "automobile"
 ]
+
+# ── MULTI-PROVIDER CONFIG ───────────────────────────────────────────────────────
+# Provider mode: smart (default), primary_only, both
+FINANCE_DATA_MODE = os.environ.get("FINANCE_DATA_MODE", "smart").lower()
+
+# API Keys (set via environment variables)
+ALPHA_VANTAGE_API_KEY = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
+FMP_API_KEY = os.environ.get("FMP_API_KEY", "")
+ALPHA_VANTAGE_PREMIUM = os.environ.get("ALPHA_VANTAGE_PREMIUM", "false").lower() == "true"
+FMP_PLAN = os.environ.get("FMP_PLAN", "free").lower()
+
+# Initialize provider manager (lazy, thread-safe initialization)
+_provider_manager = None
+_provider_manager_lock = threading.Lock()
+
+def get_provider_manager(mode=None):
+    """Return the shared provider manager.
+
+    If `mode` (a DataMode) is supplied and differs from the shared manager's
+    mode, a lightweight per-request manager is returned that reuses the same
+    provider instances (and their caches). This avoids mutating global state,
+    which is not safe under concurrent requests.
+    """
+    global _provider_manager
+    if _provider_manager is None:
+        with _provider_manager_lock:
+            if _provider_manager is None:
+                from providers import create_provider_manager, DataMode
+                mode_map = {
+                    "smart": DataMode.SMART,
+                    "primary_only": DataMode.PRIMARY_ONLY,
+                    "both": DataMode.BOTH,
+                }
+                default_mode = mode_map.get(FINANCE_DATA_MODE, DataMode.SMART)
+                _provider_manager = create_provider_manager(
+                    av_api_key=ALPHA_VANTAGE_API_KEY,
+                    fmp_api_key=FMP_API_KEY,
+                    mode=default_mode,
+                    av_premium=ALPHA_VANTAGE_PREMIUM,
+                    fmp_plan=FMP_PLAN,
+                )
+                log.info(f"Initialized provider manager: mode={default_mode.value}, "
+                         f"alpha_vantage={'configured' if ALPHA_VANTAGE_API_KEY else 'not configured'}, "
+                         f"fmp={'configured' if FMP_API_KEY else 'not configured'}")
+    if mode is not None and mode != _provider_manager.mode:
+        from providers import ProviderManager
+        return ProviderManager(
+            primary=_provider_manager.primary,
+            secondary=_provider_manager.secondary,
+            mode=mode,
+        )
+    return _provider_manager
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SCREENER HELPERS
@@ -472,7 +572,7 @@ def scrape_html(slug):
     from bs4 import BeautifulSoup
 
     url = f"{BASE}/company/{slug}/consolidated/"
-    r = req.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    r = _HTTP.get(url, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
@@ -772,7 +872,7 @@ def altman_z_score(pl, bs, key, price, shares_outstanding):
         sales = metric_match(pl, ["sales", "revenue", "net sales"])
         np_ = metric_match(pl, ["net profit", "profit after", "net income"])
         op = metric_match(pl, ["operating profit", "ebitda", "ebit"]) or metric_match(key, ["ebitda"])
-        ta = metric_match(bs, ["total", "total assets", "total liabilities"])
+        ta = bs.get("Total Assets") or metric_match(bs, ["total assets"]) or metric_match(bs, ["total", "total liabilities"])
         cl = metric_match(bs, ["borrowings", "debt", "total debt", "loans"])
         ca = metric_match(bs, ["cash", "cash & bank", "cash and bank", "cash equivalent"])
         inv = metric_match(bs, ["inventory", "inventories", "stock"])
@@ -796,7 +896,12 @@ def altman_z_score(pl, bs, key, price, shares_outstanding):
         de_val = cl.get(yr, 0) or 0
         eq_val = (eq_sc.get(yr, 0) or 0) + re_val
         shares_norm = normalize_shares(shares_outstanding)
-        mv = (price or 0) * (shares_norm or 1) / 1e7  # Cr
+        mc = metric_match(key, ["market cap"])
+        mcap_latest = list(mc.values())[-1] if mc else None
+        if mcap_latest:
+            mv = mcap_latest
+        else:
+            mv = (price or 0) * (shares_norm or 1) / 1e7  # Cr
 
         wc = ca_val - cl_val
         total_liab = t - eq_val
@@ -873,9 +978,12 @@ def magic_formula_rank(key, pl, bs, price, shares_outstanding):
 
         shares_norm = normalize_shares(shares_outstanding)
         ev = None
-        if price and shares_norm:
-            mcap = price * shares_norm / 1e7  # in Cr
-            ev = mcap + (debt_latest or 0) - (cash_latest or 0)
+        mc = metric_match(key, ["market cap"])
+        mcap_native = list(mc.values())[-1] if mc else None
+        if mcap_native is None and price and shares_norm:
+            mcap_native = price * shares_norm / 1e7  # Screener-style Cr
+        if mcap_native:
+            ev = mcap_native + (debt_latest or 0) - (cash_latest or 0)
 
         earnings_yield = None
         if ebit_latest and ev and ev > 0:
@@ -2169,7 +2277,7 @@ def get_live_price(slug, company_name=""):
     # Fallback: scrape from Screener.in company page
     try:
         url = f"{BASE}/company/{slug}/"
-        r = req.get(url, headers=HEADERS, cookies=COOKIES, timeout=10)
+        r = _HTTP.get(url, cookies=COOKIES, timeout=10)
         m = re.search(r'id="price"\s*[^>]*>\s*₹?\s*([\d.,]+)', r.text, re.I)
         if not m:
             m = re.search(r'<span[^>]*class="[^"]*price[^"]*"[^>]*>\s*₹?\s*([\d.,]+)', r.text, re.I)
@@ -2195,7 +2303,7 @@ def scrape_business_info(slug):
             "promoter_holding": None, "institutional_holding": None}
     try:
         url = f"{BASE}/company/{slug}/"
-        r = req.get(url, headers=HEADERS, cookies=COOKIES, timeout=15)
+        r = _HTTP.get(url, cookies=COOKIES, timeout=15)
         if r.status_code != 200:
             return info
 
@@ -2661,6 +2769,7 @@ def analyze_full(company_name, slug, sheets, biz_info, yahoo_data=None):
     _, int_cov    = get_metric(sheets, ["ratio","key"], ["interest coverage"])
     _, net_margin = get_metric(sheets, ["ratio","key","profit"], ["net margin"])
     _, ebitda_mrg = get_metric(sheets, ["ratio","key","profit"], ["ebitda margin"])
+    _, int_d      = get_metric(sheets, ["profit","loss","p&l","income"], ["interest"])
 
     # ── Quarterly data for Historical Trends ──
     qdata = sheets.get("Quarters", {}).get("data", {})
@@ -2754,11 +2863,11 @@ def analyze_full(company_name, slug, sheets, biz_info, yahoo_data=None):
             latest_nm_v = yahoo_data["profit_margin_yf"]
         if latest_em_v is None and yahoo_data.get("operating_margin_yf"):
             latest_em_v = yahoo_data["operating_margin_yf"]
-        if latest_int_cov is None and opm_ser and int_d:
-            op_l = lv(opm_ser)
+        if latest_int_cov is None and ebitda and int_d:
+            ebitda_l = lv(ebitda)
             int_l = lv(int_d)
-            if op_l and int_l and int_l > 0:
-                latest_int_cov = round(op_l / int_l, 1)
+            if ebitda_l and int_l and int_l > 0:
+                latest_int_cov = round(ebitda_l / int_l, 1)
 
     # ── Trend analysis ──
     debt_reduced = False
@@ -3267,8 +3376,9 @@ US_SECTORS = {
 }
 
 # ── US stock autocomplete cache ──
-_us_search_cache = {}
-_us_search_cache_time = 0
+_US_SEARCH_CACHE = {}                  # query -> (timestamp, results)
+_US_SEARCH_TTL = timedelta(minutes=10)
+_US_SEARCH_MAX = 200
 
 def _us_label(ticker, info=None):
     """Build display label for a US stock."""
@@ -3289,6 +3399,10 @@ def _us_label(ticker, info=None):
 def us_search(q):
     """Search US stocks by ticker or company name using Yahoo Finance search API."""
     import yfinance as yf
+    cache_key = q.strip().lower()
+    cached = _US_SEARCH_CACHE.get(cache_key)
+    if cached and (datetime.now() - cached[0]) < _US_SEARCH_TTL:
+        return cached[1]
     results = []
     q_upper = q.strip().upper()
     q_lower = q.strip().lower()
@@ -3344,198 +3458,322 @@ def us_search(q):
         except (KeyError, TypeError):
             pass
 
-    return results[:6]
+    results = results[:6]
+    if len(_US_SEARCH_CACHE) >= _US_SEARCH_MAX:
+        now = datetime.now()
+        for k, (ts, _) in list(_US_SEARCH_CACHE.items()):
+            if now - ts > _US_SEARCH_TTL:
+                del _US_SEARCH_CACHE[k]
+    _US_SEARCH_CACHE[cache_key] = (datetime.now(), results)
+    return results
 
 
 
 
-def fetch_us_financials(ticker):
-    """Fetch US stock data from Yahoo Finance, return in sections format compatible with scoring engines."""
-    import yfinance as yf
-    tk = yf.Ticker(ticker)
-    info = tk.info or {}
+def fetch_us_financials(ticker, mode=None):
+    """
+    Fetch US stock data using the multi-provider system.
+    Returns data in sections format compatible with scoring engines.
+    Provider metric names are aliased to the Screener.in-style names the
+    shared scoring engines expect (Sales, Net profit, Borrowings, Reserves,
+    Cash, EPS, P/E, ROE, ...).
+    """
+    pm = get_provider_manager(mode)
 
-    def _to_num(v):
-        try:
-            if isinstance(v, complex): return round(v.real, 2)
-            if isinstance(v, (int, float)): return round(float(v), 2)
-            return round(float(v), 2)
-        except (TypeError, ValueError, OverflowError):
+    # Fetch all required data from providers
+    quote_result = pm.get_quote(ticker)
+    profile_result = pm.get_company_profile(ticker)
+    income_result = pm.get_income_statement(ticker, quarterly=True)
+    balance_result = pm.get_balance_sheet(ticker, quarterly=True)
+    cashflow_result = pm.get_cash_flow(ticker, quarterly=True)
+    keymetrics_result = pm.get_key_metrics(ticker)
+
+    # Also fetch annual data for CAGR calculations
+    income_annual = pm.get_income_statement(ticker, quarterly=False)
+    balance_annual = pm.get_balance_sheet(ticker, quarterly=False)
+    cashflow_annual = pm.get_cash_flow(ticker, quarterly=False)
+
+    # Extract data
+    quote = quote_result.data if quote_result.success else None
+    profile = profile_result.data if profile_result.success else None
+    income_q = income_result.data if income_result.success else None
+    balance_q = balance_result.data if balance_result.success else None
+    cashflow_q = cashflow_result.data if cashflow_result.success else None
+    income_a = income_annual.data if income_annual.success else None
+    balance_a = balance_annual.data if balance_annual.success else None
+    cashflow_a = cashflow_annual.data if cashflow_annual.success else None
+    keymetrics = keymetrics_result.data if keymetrics_result.success else {}
+
+    # Track which provider supplied each metric
+    provider_sources = {
+        "quote": quote_result.provider.value if quote_result.success else None,
+        "profile": profile_result.provider.value if profile_result.success else None,
+        "income_q": income_result.provider.value if income_result.success else None,
+        "balance_q": balance_result.provider.value if balance_result.success else None,
+        "cashflow_q": cashflow_result.provider.value if cashflow_result.success else None,
+        "keymetrics": keymetrics_result.provider.value if keymetrics_result.success else None,
+    }
+
+    # Provider metric names → Screener.in-style names used by scoring engines
+    pl_aliases = {
+        "Revenue": "Sales",
+        "Net Income": "Net profit",
+        "Operating Income": "Operating Profit",
+        "Depreciation & Amortization": "Depreciation",
+        "Interest Expense": "Interest",
+    }
+    bs_aliases = {
+        "Total Equity": "Reserves",
+        "Cash & Equivalents": "Cash",
+    }
+
+    def _build_section(stmt, aliases=None):
+        section = {"data": {}, "years": []}
+        if not stmt or not stmt.data:
+            return section
+        aliases = aliases or {}
+        period_dates = {}
+        for metric, points in stmt.data.items():
+            name = aliases.get(metric, metric)
+            series = section["data"].setdefault(name, {})
+            for point in sorted(points, key=lambda p: p.date):
+                series[point.period] = point.value
+                period_dates[point.period] = point.date
+        section["years"] = [p for p, _ in sorted(period_dates.items(), key=lambda kv: kv[1])]
+        return section
+
+    def _pick_section(annual, quarterly):
+        if annual["data"] and len(annual["years"]) >= 2:
+            return annual
+        if quarterly["data"]:
+            return quarterly
+        return annual
+
+    pl_section = _pick_section(
+        _build_section(income_a, pl_aliases),
+        _build_section(income_q, pl_aliases),
+    )
+    bs_section = _pick_section(
+        _build_section(balance_a, bs_aliases),
+        _build_section(balance_q, bs_aliases),
+    )
+    cf_section = _pick_section(
+        _build_section(cashflow_a),
+        _build_section(cashflow_q),
+    )
+
+    pl_data = pl_section["data"]
+    bs_data = bs_section["data"]
+    cf_data = cf_section["data"]
+
+    # Borrowings = Total Debt when available, else Long-term + Short-term debt
+    lt_debt = bs_data.get("Long-term Debt", {})
+    st_debt = bs_data.get("Short-term Debt", {})
+    tot_debt = bs_data.get("Total Debt", {})
+    borrowings = {}
+    debt_periods = [p for p in bs_section["years"] if p in lt_debt or p in st_debt or p in tot_debt]
+    for period in debt_periods:
+        if tot_debt.get(period) is not None:
+            borrowings[period] = tot_debt[period]
+        elif lt_debt.get(period) is not None or st_debt.get(period) is not None:
+            borrowings[period] = (lt_debt.get(period) or 0) + (st_debt.get(period) or 0)
+    if borrowings:
+        bs_data["Borrowings"] = borrowings
+
+    # EBITDA = Operating Profit + Depreciation (when not reported directly)
+    ebitda_series = dict(pl_data.get("EBITDA", {}))
+    op_series = pl_data.get("Operating Profit", {})
+    dep_series = pl_data.get("Depreciation", {})
+    for period, op_val in op_series.items():
+        if (ebitda_series.get(period) is None and op_val is not None
+                and dep_series.get(period) is not None):
+            ebitda_series[period] = op_val + dep_series[period]
+    if ebitda_series:
+        pl_data["EBITDA"] = ebitda_series
+
+    # ── Build Key section: Screener.in-style ratio names with per-year series ──
+    key_data = {}
+    price_latest = quote.price if quote else None
+    shares_latest = profile.shares_outstanding if profile else None
+
+    if quote:
+        key_data["Price"] = {"Latest": quote.price}
+        key_data["Change"] = {"Latest": quote.change}
+        key_data["Change %"] = {"Latest": quote.change_percent}
+        key_data["Volume"] = {"Latest": quote.volume}
+    if profile:
+        key_data["Market Cap"] = {"Latest": profile.market_cap}
+        key_data["Shares Outstanding"] = {"Latest": profile.shares_outstanding}
+
+    sales_s = pl_data.get("Sales", {})
+    profit_s = pl_data.get("Net profit", {})
+    interest_s = pl_data.get("Interest", {})
+    equity_s = bs_data.get("Reserves", {})
+    debt_s = bs_data.get("Borrowings", {})
+    shares_s = bs_data.get("No. of Equity Shares", {})
+    cash_s = bs_data.get("Cash", {})
+    inv_s = bs_data.get("Inventory", {})
+    recv_s = bs_data.get("Receivables", {})
+    ca_s = bs_data.get("Current Assets", {})
+    cl_s = bs_data.get("Current Liabilities", {})
+
+    def _key_set(name, period, value):
+        if value is not None:
+            key_data.setdefault(name, {})[period] = value
+
+    ordered_years = pl_section["years"]
+    for yr in ordered_years:
+        sales = sales_s.get(yr)
+        profit = profit_s.get(yr)
+        op = op_series.get(yr)
+        dep = dep_series.get(yr)
+        interest = interest_s.get(yr)
+        equity = equity_s.get(yr)
+        debt = debt_s.get(yr)
+        cash = cash_s.get(yr)
+        shares = shares_s.get(yr) or shares_latest
+
+        eps_yr = None
+        if profit is not None and shares and shares > 0:
+            eps_yr = round(profit / shares, 2)
+            _key_set("EPS", yr, eps_yr)
+        if equity is not None and shares and shares > 0:
+            _key_set("BVPS", yr, round(equity / shares, 2))
+        if op is not None and dep is not None:
+            _key_set("EBITDA", yr, op + dep)
+        if sales and sales > 0:
+            if op is not None:
+                _key_set("OPM", yr, round(op / sales * 100, 1))
+            if profit is not None:
+                _key_set("Net Margin", yr, round(profit / sales * 100, 1))
+        if profit is not None and equity and equity > 0:
+            _key_set("ROE", yr, round(profit / equity * 100, 1))
+        if op is not None and (equity is not None or debt is not None):
+            capital_employed = (equity or 0) + (debt or 0)
+            if capital_employed > 0:
+                _key_set("ROCE", yr, round(op / capital_employed * 100, 1))
+        if debt is not None and equity and equity > 0:
+            _key_set("Debt/Equity", yr, round(debt / equity, 2))
+        if op is not None and interest and interest > 0:
+            _key_set("Interest Coverage", yr, round(op / interest, 1))
+        if ca_s.get(yr) and cl_s.get(yr) and cl_s[yr] > 0:
+            _key_set("Current Ratio", yr, round(ca_s[yr] / cl_s[yr], 1))
+        else:
+            cr_assets = (cash or 0) + (inv_s.get(yr) or 0) + (recv_s.get(yr) or 0)
+            cr_liab = debt or 0
+            if cr_assets > 0 and cr_liab > 0:
+                _key_set("Current Ratio", yr, round(cr_assets / cr_liab, 1))
+        if price_latest is not None and eps_yr and eps_yr > 0 and yr == ordered_years[-1]:
+            _key_set("P/E", yr, round(price_latest / eps_yr, 1))
+
+    # Provider-supplied TTM values as fallback when statements lack a metric
+    def _as_percent(v):
+        if v is None:
             return None
+        return round(v * 100, 1) if abs(v) <= 1.5 else round(v, 1)
 
-    def collect(fin_df):
-        """Convert yfinance DataFrame to {metric: {year: val}} — sorted oldest-first."""
-        d = {}
-        if fin_df is None or fin_df.empty:
-            return d
-        for idx in fin_df.index:
-            series = fin_df.loc[idx]
-            yr_vals = {}
-            for col, val in zip(series.index, series.values):
-                if val is not None and pd.notna(val):
-                    yr = str(col.year) if hasattr(col, 'year') else str(col)
-                    num = _to_num(val)
-                    if num is not None:
-                        yr_vals[yr] = num
-            if yr_vals:
-                d[str(idx)] = dict(sorted(yr_vals.items()))
-        return d
+    de_prov = keymetrics.get("debt_to_equity")
+    if de_prov is not None and abs(de_prov) > 5:
+        de_prov = round(de_prov / 100.0, 2)  # provider returned percent
 
-    pl_raw = collect(tk.financials)
-    bs_raw = collect(tk.balance_sheet)
-    cf_raw = collect(tk.cashflow)
+    provider_fallbacks = {
+        "EPS": keymetrics.get("eps_ttm"),
+        "BVPS": keymetrics.get("book_value_per_share"),
+        "P/E": keymetrics.get("pe_ratio"),
+        "ROE": _as_percent(keymetrics.get("return_on_equity")),
+        "OPM": _as_percent(keymetrics.get("operating_margin")),
+        "Net Margin": _as_percent(keymetrics.get("profit_margin")),
+        "Debt/Equity": de_prov,
+        "Current Ratio": keymetrics.get("current_ratio"),
+        "Interest Coverage": keymetrics.get("interest_coverage"),
+        "EBITDA": keymetrics.get("ebitda_ttm"),
+    }
+    for name, value in provider_fallbacks.items():
+        if value is not None and not key_data.get(name):
+            key_data[name] = {"Latest": value}
 
-    # Build sections dict
-    pl_section = {"data": {}, "years": []}
-    bs_section = {"data": {}, "years": []}
-    cf_section = {"data": {}, "years": []}
-    key_section = {"data": {}, "years": []}
+    # Build a compatible info dict for the rest of the analysis
+    # This mimics the yfinance info dict structure
+    info_dict = {}
+    if quote:
+        info_dict.update({
+            "currentPrice": quote.price,
+            "regularMarketPrice": quote.price,
+            "previousClose": quote.price,
+            "regularMarketChange": quote.change,
+            "regularMarketChangePercent": quote.change_percent,
+            "volume": quote.volume,
+            "marketCap": quote.market_cap,
+        })
+    if profile:
+        info_dict.update({
+            "longName": profile.name,
+            "shortName": profile.name,
+            "sector": profile.sector,
+            "industry": profile.industry,
+            "longBusinessSummary": profile.description,
+            "marketCap": profile.market_cap,
+            "sharesOutstanding": profile.shares_outstanding,
+        })
+    if keymetrics:
+        info_dict.update({
+            "trailingPE": keymetrics.get("pe_ratio"),
+            "forwardPE": keymetrics.get("forward_pe"),
+            "trailingPegRatio": keymetrics.get("peg_ratio"),
+            "priceToBook": keymetrics.get("price_to_book"),
+            "priceToSalesTrailing12Months": keymetrics.get("price_to_sales"),
+            "trailingEps": keymetrics.get("eps_ttm"),
+            "forwardEps": keymetrics.get("forward_eps"),
+            "bookValue": keymetrics.get("book_value_per_share"),
+            "returnOnEquity": keymetrics.get("return_on_equity"),
+            "debtToEquity": round(de_prov * 100, 2) if de_prov is not None else None,
+            "currentRatio": keymetrics.get("current_ratio"),
+            "profitMargins": keymetrics.get("profit_margin"),
+            "operatingMargins": keymetrics.get("operating_margin"),
+            "freeCashflow": keymetrics.get("free_cash_flow_ttm"),
+            "operatingCashflow": keymetrics.get("operating_cashflow"),
+            "revenueGrowth": keymetrics.get("revenue_growth"),
+            "earningsGrowth": keymetrics.get("earnings_growth"),
+            "beta": keymetrics.get("beta"),
+            "dividendYield": keymetrics.get("dividend_yield"),
+            "payoutRatio": keymetrics.get("payout_ratio"),
+            "targetMeanPrice": keymetrics.get("analyst_target_price"),
+            "fiftyTwoWeekHigh": keymetrics.get("fifty_two_week_high"),
+            "fiftyTwoWeekLow": keymetrics.get("fifty_two_week_low"),
+            "fiftyDayAverage": keymetrics.get("fifty_day_avg"),
+            "twoHundredDayAverage": keymetrics.get("two_hundred_day_avg"),
+            "heldPercentInstitutions": keymetrics.get("held_percent_institutions"),
+            "heldPercentInsiders": keymetrics.get("held_percent_insiders"),
+            "totalCash": keymetrics.get("total_cash"),
+            "totalDebt": keymetrics.get("total_debt"),
+            "returnOnAssets": keymetrics.get("return_on_assets"),
+        })
 
-    # Map yfinance financials to our metric names
-    rev_map = {"Total Revenue": "Sales", "Revenue": "Sales", "Operating Revenue": "Sales"}
-    for yf_key, our_key in rev_map.items():
-        if yf_key in pl_raw:
-            pl_section["data"][our_key] = pl_raw[yf_key]
-            break
-    if "Sales" not in pl_section["data"]:
-        # Try keyword match
-        for k, v in pl_raw.items():
-            kl = k.lower()
-            if any(w in kl for w in ["total revenue", "revenue", "sales", "operating revenue"]):
-                pl_section["data"]["Sales"] = v
-                break
-
-    np_map = {"Net Income": "Net profit", "Net Income From Continuing Operation Net Minority Interest": "Net profit"}
-    for yf_key, our_key in np_map.items():
-        if yf_key in pl_raw:
-            pl_section["data"][our_key] = pl_raw[yf_key]
-            break
-    if "Net profit" not in pl_section["data"]:
-        for k, v in pl_raw.items():
-            kl = k.lower()
-            if any(w in kl for w in ["net income", "net profit", "net earnings"]):
-                if "discontinued" not in kl and "comprehensive" not in kl:
-                    pl_section["data"]["Net profit"] = v
-                    break
-
-    for yf_key, our_key in [("EBITDA", "EBITDA"), ("EBIT", "Operating Profit")]:
-        if yf_key in pl_raw:
-            pl_section["data"][our_key] = pl_raw[yf_key]
-    if "Operating Profit" not in pl_section["data"]:
-        for k, v in pl_raw.items():
-            kl = k.lower()
-            if any(w in kl for w in ["operating income", "ebit"]):
-                pl_section["data"]["Operating Profit"] = v
-                break
-
-    if "Interest Expense" in pl_raw:
-        pl_section["data"]["Interest"] = {k: abs(v) if v else 0 for k, v in pl_raw["Interest Expense"].items()}
-    if "Depreciation And Amortization" in pl_raw:
-        pl_section["data"]["Depreciation"] = {k: abs(v) if v else 0 for k, v in pl_raw["Depreciation And Amortization"].items()}
-
-    # Balance sheet
-    for yf_key, our_key in [("Total Debt", "Borrowings"), ("Stockholders Equity", "Reserves"),
-                              ("Total Equity Gross Minority Interest", "Equity"),
-                              ("Cash And Cash Equivalents", "Cash"),
-                              ("Cash And Cash Equivalents, Reported", "Cash"),
-                              ("Current Assets", "Current Assets"),
-                              ("Current Liabilities", "Current Liabilities"),
-                              ("Inventory", "Inventory"),
-                              ("Accounts Receivable", "Receivables"),
-                              ("Total Assets", "Total Assets")]:
-        if yf_key in bs_raw:
-            bs_section["data"][our_key] = bs_raw[yf_key]
-    # Try keyword fallback for key BS items
-    if "Borrowings" not in bs_section["data"]:
-        for k, v in bs_raw.items():
-            kl = k.lower()
-            if any(w in kl for w in ["total debt", "borrowings"]):
-                bs_section["data"]["Borrowings"] = v
-                break
-    if "Cash" not in bs_section["data"]:
-        for k, v in bs_raw.items():
-            kl = k.lower()
-            if any(w in kl for w in ["cash and cash equivalents", "cash", "cash equivalents"]):
-                if "restricted" not in kl:
-                    bs_section["data"]["Cash"] = v
-                    break
-    if "Reserves" not in bs_section["data"]:
-        for k, v in bs_raw.items():
-            kl = k.lower()
-            if any(w in kl for w in ["stockholders equity", "total equity", "shareholders equity"]):
-                bs_section["data"]["Reserves"] = v
-                break
-    if "No. of Equity Shares" not in bs_section["data"]:
-        shares = info.get("sharesOutstanding")
-        if shares:
-            bs_section["data"]["No. of Equity Shares"] = {"Latest": float(shares)}
-
-    # Cash flow items
-    for yf_key, our_key in [("Free Cash Flow", "Free Cash Flow"),
-                              ("Capital Expenditure", "Capex"),
-                              ("Operating Cash Flow", "Cash from Operating Activity")]:
-        if yf_key in cf_raw:
-            cf_section["data"][our_key] = {k: abs(v) if v else 0 for k, v in cf_raw[yf_key].items()}
-    if "Cash from Operating Activity" not in cf_section["data"]:
-        cfo = info.get("operatingCashflow")
-        if cfo:
-            cf_section["data"]["Cash from Operating Activity"] = {"Latest": float(cfo)}
-    if "Capex" not in cf_section["data"]:
-        for k, v in cf_raw.items():
-            kl = k.lower()
-            if any(w in kl for w in ["capital expenditure", "capex"]):
-                cf_section["data"]["Capex"] = {k2: abs(v2) if v2 else 0 for k2, v2 in v.items()}
-                break
-
-    # Key ratios from info dict
-    cur_price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose")
-    if cur_price:
-        key_section["data"]["Price"] = {"Latest": float(cur_price)}
-    if info.get("trailingEps"):
-        key_section["data"]["EPS"] = {"Latest": float(info["trailingEps"])}
-    if info.get("bookValue") and info["bookValue"] > 0:
-        key_section["data"]["BVPS"] = {"Latest": float(info["bookValue"])}
-    if info.get("trailingPE"):
-        key_section["data"]["P/E"] = {"Latest": float(info["trailingPE"])}
-    if info.get("returnOnEquity") is not None:
-        key_section["data"]["ROE"] = {"Latest": round(float(info["returnOnEquity"]) * 100, 1)}
-    if info.get("priceToBook") and info["priceToBook"] > 0:
-        key_section["data"]["P/B"] = {"Latest": float(info["priceToBook"])}
-    if info.get("debtToEquity") is not None:
-        key_section["data"]["Debt/Equity"] = {"Latest": round(float(info["debtToEquity"]) / 100, 2)}
-    if info.get("currentRatio"):
-        key_section["data"]["Current Ratio"] = {"Latest": float(info["currentRatio"])}
-    if info.get("profitMargins") is not None:
-        key_section["data"]["Net Margin"] = {"Latest": round(float(info["profitMargins"]) * 100, 1)}
-    if info.get("operatingMargins") is not None:
-        key_section["data"]["OPM"] = {"Latest": round(float(info["operatingMargins"]) * 100, 1)}
-    if info.get("freeCashflow"):
-        key_section["data"]["Free Cash Flow"] = {"Latest": float(info["freeCashflow"])}
-    if info.get("revenueGrowth") is not None:
-        key_section["data"]["Revenue Growth"] = {"Latest": round(float(info["revenueGrowth"]) * 100, 1)}
-
-    # Build all_years from sales data
-    sales_data = pl_section["data"].get("Sales", {})
-    pl_years = sorted(sales_data.keys(), key=lambda y: (len(y), y)) if sales_data else []
-    bs_years = sorted(bs_section["data"].get("Borrowings", {}).keys(), key=lambda y: (len(y), y)) if bs_section["data"].get("Borrowings") else pl_years
-
-    pl_section["years"] = pl_years
-    bs_section["years"] = bs_years
-    key_section["years"] = ["Latest"]
+    # Add provider source tracking to metadata
+    metadata = {
+        "_info": {
+            **info_dict,
+            "provider_sources": provider_sources,
+            "quote_raw": quote.metadata if quote else {},
+            "profile_raw": profile.metadata if profile else {},
+            "keymetrics_raw": keymetrics,
+        },
+        "_ticker": ticker,
+        "provider_mode": FINANCE_DATA_MODE,
+    }
 
     return {
         "Profit & Loss": pl_section,
         "Balance Sheet": bs_section,
         "Cash Flow": cf_section,
-        "Key": key_section,
-        "_info": info,
-        "_ticker": ticker,
+        "Key": {"data": key_data, "years": pl_section["years"] or ["Latest"]},
+        **metadata,
     }
 
 
-def analyze_us_stock(ticker):
+def analyze_us_stock(ticker, mode=None):
     """Full analysis of a US stock using the same investor frameworks as Indian stocks."""
-    sections = fetch_us_financials(ticker)
+    sections = fetch_us_financials(ticker, mode)
     info = sections.get("_info", {})
 
     pl = sections.get("Profit & Loss", {}).get("data", {})
@@ -3891,6 +4129,19 @@ def analyze_us_stock(ticker):
         latest_roce_v, latest_roe_v
     )
 
+    # Fetch historical P/E data using provider manager
+    pm = get_provider_manager(mode)
+    pe_result = pm.get_historical_pe(ticker, max_quarters=20)
+    if pe_result.success and pe_result.data:
+        result["historical_pe"] = {
+            "ticker": ticker.upper(),
+            "metric": "PE",
+            "period": "quarterly",
+            "source": pe_result.provider.value if pe_result.provider else "multi",
+            "data": [p.to_dict() for p in pe_result.data],
+        }
+        log.info(f"Fetched {len(pe_result.data)} historical P/E quarters for {ticker} from {pe_result.provider.value if pe_result.provider else 'multi'}")
+
     # ── CONSENSUS VERDICT for US stocks ──
     entry_zones_rec = zones.get("recommendation") if zones else None
     investor_verdict = fw_overall.get("verdict") if fw_overall else None
@@ -3903,6 +4154,32 @@ def analyze_us_stock(ticker):
         score_verdict_text=verdict,
         buy_gate_text=buy_gate_text,
     )
+
+    # Add provider metadata to result
+    provider_sources = sections.get("_info", {}).get("provider_sources", {})
+    result["provider_metadata"] = provider_sources
+    result["provider_mode"] = FINANCE_DATA_MODE
+
+    # Extract discrepancies from keymetrics and other merged data
+    discrepancies = {}
+    keymetrics_raw = sections.get("_info", {}).get("keymetrics_raw", {})
+    for key, value in keymetrics_raw.items():
+        if key.endswith("_discrepancy") and isinstance(value, dict):
+            metric_name = key.replace("_discrepancy", "")
+            discrepancies[metric_name] = value
+
+    # Also check for discrepancies in the merged quote data
+    quote_raw = sections.get("_info", {}).get("quote_raw", {})
+    if quote_raw.get("price_diff_pct") and quote_raw["price_diff_pct"] > 5:
+        discrepancies["price"] = {
+            "primary": quote_raw.get("primary_price"),
+            "secondary": quote_raw.get("secondary_price"),
+            "secondary_provider": quote_raw.get("secondary_provider"),
+            "diff_pct": round(quote_raw["price_diff_pct"], 2),
+        }
+
+    if discrepancies:
+        result["provider_discrepancies"] = discrepancies
 
     return result
 
@@ -3955,17 +4232,39 @@ def us_sector_analysis(sector_name):
 # ── SECTOR ANALYSIS CACHE ────────────────────────────────────────────────────
 SECTOR_CACHE = {}
 SECTOR_CACHE_TTL = timedelta(minutes=30)
+_SECTOR_LOCKS = {}
+_SECTOR_LOCKS_GUARD = threading.Lock()
+# Sector peer comparison inside a single-stock analysis triggers full sector
+# analysis of 12-15 tickers (~120 provider calls) which can exceed serverless
+# request limits. Default: only use already-cached sector data in that path.
+# Set SECTOR_CONTEXT=full to compute it on demand (better for long-running hosts).
+SECTOR_CONTEXT_MODE = os.environ.get("SECTOR_CONTEXT", "cache").strip().lower()
 
-def get_cached_sector_analysis(sector_name):
-    now = datetime.now()
+def _sector_lock(key):
+    with _SECTOR_LOCKS_GUARD:
+        lock = _SECTOR_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _SECTOR_LOCKS[key] = lock
+        return lock
+
+def get_cached_sector_analysis(sector_name, allow_fetch=True):
     key = sector_name.lower()
-    if key in SECTOR_CACHE:
-        entry = SECTOR_CACHE[key]
-        if now - entry["ts"] < SECTOR_CACHE_TTL:
+    entry = SECTOR_CACHE.get(key)
+    if entry and datetime.now() - entry["ts"] < SECTOR_CACHE_TTL:
+        return entry["data"]
+    if not allow_fetch:
+        # Stale-but-present data still beats nothing; otherwise report missing.
+        return entry["data"] if entry else {"error": "Sector analysis not cached"}
+    # Serialize computation per sector so concurrent requests don't analyze
+    # the same sector in parallel.
+    with _sector_lock(key):
+        entry = SECTOR_CACHE.get(key)
+        if entry and datetime.now() - entry["ts"] < SECTOR_CACHE_TTL:
             return entry["data"]
-    data = us_sector_analysis(sector_name)
-    SECTOR_CACHE[key] = {"ts": now, "data": data}
-    return data
+        data = us_sector_analysis(sector_name)
+        SECTOR_CACHE[key] = {"ts": datetime.now(), "data": data}
+        return data
 
 def find_sector_for_ticker(ticker):
     """Find which predefined US sector a ticker belongs to."""
@@ -3981,7 +4280,9 @@ def compute_sector_context(ticker, framework_results, overall_fundamentals_score
     if not sector:
         return None
 
-    sector_data = get_cached_sector_analysis(sector)
+    sector_data = get_cached_sector_analysis(
+        sector, allow_fetch=(SECTOR_CONTEXT_MODE == "full")
+    )
     if "error" in sector_data:
         return None
 
@@ -4038,6 +4339,305 @@ def compute_sector_context(ticker, framework_results, overall_fundamentals_score
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# HISTORICAL P/E DATA FOR US STOCKS
+# ══════════════════════════════════════════════════════════════════════════════
+
+_US_PE_CACHE = {}
+_US_PE_TTL = timedelta(hours=6)
+
+
+def _pe_quarter_end(announce_ts):
+    """Best-effort fiscal quarter-end date for an earnings announcement.
+
+    Yahoo publishes earnings ~30-50 days after a fiscal quarter closes, so
+    back up ~45 days and snap to the nearest calendar quarter end when it is
+    within ~20 days. Used for labelling and for looking up the quarter-end price.
+    """
+    import pandas as pd
+
+    approx = pd.Timestamp(announce_ts).tz_localize(None) - pd.Timedelta(days=45)
+    candidates = []
+    for year in (approx.year - 1, approx.year, approx.year + 1):
+        for month in (3, 6, 9, 12):
+            candidates.append(pd.Timestamp(year, month, 1) + pd.offsets.MonthEnd(0))
+    nearest = min(candidates, key=lambda d: abs((d - approx).days))
+    if abs((nearest - approx).days) <= 20:
+        return nearest.normalize()
+    return approx.normalize()
+
+
+def _pe_price_near(hist, q_end):
+    """Close price on the trading day nearest to q_end (within 10 days)."""
+    import pandas as pd
+
+    idx = hist.index
+    naive = idx.tz_localize(None) if getattr(idx, "tz", None) is not None else idx
+    target = pd.Timestamp(q_end)
+    pos = naive.get_indexer([target], method="nearest")[0]
+    if pos < 0 or abs((naive[pos] - target).days) > 10:
+        return None
+    try:
+        val = hist["Close"].iloc[pos]
+        return float(val) if pd.notna(val) else None
+    except Exception:
+        return None
+
+
+def _pe_from_earnings_history(tk, hist, ticker):
+    """Build quarterly P/E points from Yahoo's reported quarterly EPS history.
+
+    This is the primary source because Yahoo's income-statement endpoints only
+    expose ~5 quarterly periods, while the earnings calendar exposes 20+ years
+    of reported EPS. TTM EPS = sum of the four most recent reported quarters.
+    Quarters whose TTM EPS is <= 0 get pe=None (rendered as N/A, never faked).
+    """
+    import pandas as pd
+
+    try:
+        earnings = tk.get_earnings_dates(limit=100)
+    except Exception as e:
+        log.info("get_earnings_dates failed for %s: %s", ticker, e)
+        return None
+    if earnings is None or getattr(earnings, "empty", True):
+        return None
+
+    eps_col = None
+    for c in earnings.columns:
+        if str(c).strip().lower() == "reported eps":
+            eps_col = c
+            break
+    if eps_col is None:
+        return None
+
+    past = earnings.dropna(subset=[eps_col])
+    if past.empty:
+        return None
+    past = past[past.index < pd.Timestamp.now(tz="UTC")]
+    past = past[~past.index.duplicated(keep="last")].sort_index()
+    # Keep enough history to cover the 5y price window plus the 4-quarter TTM lag
+    past = past.tail(40)
+    if len(past) < 4:
+        return None
+
+    eps_series = past[eps_col].astype(float)
+    dates = list(eps_series.index)
+
+    pe_data = []
+    for i in range(3, len(dates)):
+        try:
+            ttm_eps = float(eps_series.iloc[i - 3:i + 1].sum())
+        except Exception:
+            continue
+        q_end = _pe_quarter_end(dates[i])
+        price = _pe_price_near(hist, q_end)
+        if price is None:
+            continue
+        pe_data.append({
+            "quarter": f"Q{(q_end.month - 1) // 3 + 1} {q_end.year}",
+            "date": q_end.strftime("%Y-%m-%d"),
+            "pe": round(price / ttm_eps, 2) if ttm_eps > 0 else None,
+            "eps": round(ttm_eps, 2),
+            "price": round(price, 2),
+        })
+
+    if len(pe_data) < 4:
+        return None
+
+    pe_data.sort(key=lambda x: x["date"])
+    return {
+        "ticker": ticker.upper(),
+        "metric": "PE",
+        "period": "quarterly",
+        "source": "yahoo_earnings_history",
+        "data": pe_data[-20:],
+    }
+
+
+def fetch_historical_pe(ticker):
+    """Fetch historical quarterly P/E ratio for a US stock using Yahoo Finance.
+    
+    Calculates P/E = Historical Stock Price (quarter end) / TTM EPS (quarter end)
+    Returns at least 16 quarters of data when available.
+    """
+    import yfinance as yf
+    import pandas as pd
+    
+    try:
+        tk = yf.Ticker(ticker)
+
+        # Get historical price data (quarterly)
+        # We need prices at quarter end dates
+        hist = tk.history(period="5y", interval="1d")
+        if hist is None or hist.empty:
+            return None
+
+        # Primary source: Yahoo reported quarterly EPS history (20+ quarters).
+        # Yahoo's income-statement endpoints only expose ~5 quarterly periods,
+        # which is not enough for the 16-quarter chart requirement.
+        primary = _pe_from_earnings_history(tk, hist, ticker)
+        if primary:
+            return primary
+
+        # Fallback: derive TTM EPS from quarterly net income statements
+        # (typically only ~5 quarters of history from Yahoo).
+        # Get quarterly financials (income statement)
+        quarterly_income = tk.quarterly_financials
+        if quarterly_income is None or quarterly_income.empty:
+            return None
+
+        # Get quarterly balance sheet for shares outstanding
+        quarterly_balance = tk.quarterly_balance_sheet
+
+        # Find TTM Net Income (Net Income row)
+        net_income_row = None
+        for idx in quarterly_income.index:
+            idx_lower = str(idx).lower()
+            if any(kw in idx_lower for kw in ["net income", "net profit", "net earnings"]):
+                if "discontinued" not in idx_lower and "comprehensive" not in idx_lower:
+                    net_income_row = quarterly_income.loc[idx]
+                    break
+        
+        if net_income_row is None:
+            return None
+        
+        # Find diluted shares outstanding
+        shares_row = None
+        if quarterly_balance is not None and not quarterly_balance.empty:
+            for idx in quarterly_balance.index:
+                idx_lower = str(idx).lower()
+                if any(kw in idx_lower for kw in ["diluted shares", "shares outstanding", "common stock"]):
+                    if "diluted" in idx_lower or "outstanding" in idx_lower:
+                        shares_row = quarterly_balance.loc[idx]
+                        break
+        
+        # Convert net income to dict {date: value}
+        net_income_dict = {}
+        for col, val in net_income_row.items():
+            if pd.notna(val):
+                try:
+                    dt = pd.Timestamp(col)
+                    net_income_dict[dt] = float(val)
+                except (ValueError, TypeError):
+                    pass
+        
+        # Convert shares to dict {date: value}
+        shares_dict = {}
+        if shares_row is not None:
+            for col, val in shares_row.items():
+                if pd.notna(val):
+                    try:
+                        dt = pd.Timestamp(col)
+                        shares_dict[dt] = float(val)
+                    except (ValueError, TypeError):
+                        pass
+        
+        # If no quarterly shares data, use current shares outstanding
+        current_shares = tk.info.get("sharesOutstanding")
+        
+        # Sort dates
+        sorted_dates = sorted(net_income_dict.keys(), reverse=True)
+        
+        # Calculate TTM EPS for each quarter
+        # TTM = sum of last 4 quarters of net income / shares
+        pe_data = []
+        
+        # We need at least 4 quarters for TTM
+        for i, q_date in enumerate(sorted_dates):
+            # Get the last 4 quarters including this one
+            ttm_dates = sorted_dates[i:i+4] if i+4 <= len(sorted_dates) else sorted_dates[i:]
+            
+            if len(ttm_dates) < 4:
+                # Not enough quarters for TTM, skip or use available
+                # For older quarters, we might not have 4 quarters of history
+                continue
+            
+            ttm_net_income = sum(net_income_dict.get(d, 0) for d in ttm_dates)
+            
+            # Get shares for this quarter (use quarter's shares or current)
+            q_shares = shares_dict.get(q_date, current_shares)
+            if not q_shares or q_shares <= 0:
+                continue
+            
+            ttm_eps = ttm_net_income / q_shares
+            
+            if ttm_eps <= 0:
+                # Negative or zero EPS - P/E not meaningful
+                pe_data.append({
+                    "quarter": f"Q{(q_date.month-1)//3+1} {q_date.year}",
+                    "date": q_date.strftime("%Y-%m-%d"),
+                    "pe": None,
+                    "eps": round(ttm_eps, 2),
+                    "price": None
+                })
+                continue
+            
+            # Get stock price at quarter end
+            # Find closest trading day to quarter end
+            quarter_end = pd.Timestamp(q_date.year, q_date.month, 
+                31 if q_date.month in [3, 12] else 30 if q_date.month in [6, 9] else 28)
+            
+            # Find closest price date
+            price_dates = hist.index
+            closest_idx = price_dates.get_indexer([quarter_end], method='nearest')[0]
+            if closest_idx >= 0 and closest_idx < len(price_dates):
+                price_date = price_dates[closest_idx]
+                price = hist.loc[price_date, 'Close']
+            else:
+                price = None
+            
+            if price is not None and price > 0:
+                pe = price / ttm_eps
+                pe_data.append({
+                    "quarter": f"Q{(q_date.month-1)//3+1} {q_date.year}",
+                    "date": q_date.strftime("%Y-%m-%d"),
+                    "pe": round(pe, 2),
+                    "eps": round(ttm_eps, 2),
+                    "price": round(float(price), 2)
+                })
+            else:
+                pe_data.append({
+                    "quarter": f"Q{(q_date.month-1)//3+1} {q_date.year}",
+                    "date": q_date.strftime("%Y-%m-%d"),
+                    "pe": None,
+                    "eps": round(ttm_eps, 2),
+                    "price": None
+                })
+        
+        # Sort by date ascending (oldest first)
+        pe_data.sort(key=lambda x: x["date"])
+        
+        # Return at most 20 quarters, at least 16 if available
+        return {
+            "ticker": ticker.upper(),
+            "metric": "PE",
+            "period": "quarterly",
+            "data": pe_data[-20:] if len(pe_data) > 20 else pe_data
+        }
+        
+    except Exception as e:
+        log.warning("fetch_historical_pe failed for %s: %s", ticker, e)
+        return None
+
+
+def get_cached_historical_pe(ticker):
+    """Get cached historical P/E data or fetch fresh."""
+    now = datetime.now()
+    key = ticker.upper()
+    if key in _US_PE_CACHE:
+        entry = _US_PE_CACHE[key]
+        if now - entry["ts"] < _US_PE_TTL:
+            return entry["data"]
+    data = fetch_historical_pe(ticker)
+    if data:
+        _US_PE_CACHE[key] = {"ts": now, "data": data}
+        # Clean old entries
+        for k, v in list(_US_PE_CACHE.items()):
+            if (now - v["ts"]) > _US_PE_TTL:
+                del _US_PE_CACHE[k]
+    return data
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ROUTES
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -4058,7 +4658,7 @@ def search():
         return jsonify({"error": "Query too long"}), 400
     try:
         url = f"{BASE}/api/company/search/?q={req.utils.quote(q)}&v=3"
-        r   = req.get(url, headers=HEADERS, cookies=COOKIES, timeout=REQUEST_TIMEOUT)
+        r   = _HTTP.get(url, cookies=COOKIES, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         return jsonify(r.json()[:6])
     except req.RequestException as e:
@@ -4092,11 +4692,11 @@ def analyze_route():
     try:
         # get export url
         page_url = f"{BASE}/company/{slug}/consolidated/"
-        r        = req.get(page_url, headers=HEADERS, cookies=COOKIES, timeout=REQUEST_TIMEOUT)
+        r        = _HTTP.get(page_url, cookies=COOKIES, timeout=REQUEST_TIMEOUT)
         match    = re.search(r'(?:href|formaction)="(/user/company/export/\d+/)"', r.text)
         if not match:
             page_url = f"{BASE}/company/{slug}/"
-            r        = req.get(page_url, headers=HEADERS, cookies=COOKIES, timeout=REQUEST_TIMEOUT)
+            r        = _HTTP.get(page_url, cookies=COOKIES, timeout=REQUEST_TIMEOUT)
             match    = re.search(r'(?:href|formaction)="(/user/company/export/\d+/)"', r.text)
         if not match:
             log.info("No export URL for slug=%s, falling back to HTML scrape", slug)
@@ -4116,7 +4716,7 @@ def analyze_route():
 
         export_url = BASE + match.group(1)
         # GET the export page to obtain CSRF token
-        r2 = req.get(export_url, headers=HEADERS, cookies=COOKIES, timeout=(5, 15))
+        r2 = _HTTP.get(export_url, cookies=COOKIES, timeout=(5, 15))
         r2.raise_for_status()
         csrf_match = re.search(r'csrfmiddlewaretoken[^>]+value="([^"]+)"', r2.text)
         if not csrf_match:
@@ -4127,18 +4727,19 @@ def analyze_route():
         # Merge COOKIES with any new cookies from the response (csrftoken)
         all_cookies = {**COOKIES, **{k: v for k, v in r2.cookies.items()}}
         # POST to export URL with CSRF token to download the actual Excel file
-        r3 = req.post(export_url, headers=HEADERS, cookies=all_cookies,
+        r3 = _HTTP.post(export_url, cookies=all_cookies,
                       data={"csrfmiddlewaretoken": csrf_token, "next": page_url},
                       timeout=(5, 15))
         r3.raise_for_status()
 
         # Validate response is actually an Excel file, not a login/register redirect
         content = r3.content
-        is_excel = (content[:2] == b'PK'                    # .xlsx (ZIP)
-                    or content[:4] == b'\xd0\xcf\x11\xe0'  # .xls (OLE2)
-                    or (len(content) > 500
-                        and (b'worksheet' in content[:2000].lower()
-                             or b'<?xml' in content[:200].lower())))
+        is_excel = (len(content) <= MAX_REMOTE_BYTES
+                    and (content[:2] == b'PK'                    # .xlsx (ZIP)
+                         or content[:4] == b'\xd0\xcf\x11\xe0'  # .xls (OLE2)
+                         or (len(content) > 500
+                             and (b'worksheet' in content[:2000].lower()
+                                  or b'<?xml' in content[:200].lower()))))
         if not is_excel:
             log.info("Excel export failed for slug=%s, falling back to HTML scrape", slug)
             sheets = scrape_html(slug)
@@ -4270,11 +4871,11 @@ def generate_pdf():
         try:
             # Reuse the analysis logic directly instead of calling test_client
             page_url = f"{BASE}/company/{slug}/consolidated/"
-            r = req.get(page_url, headers=HEADERS, cookies=COOKIES, timeout=REQUEST_TIMEOUT)
+            r = _HTTP.get(page_url, cookies=COOKIES, timeout=REQUEST_TIMEOUT)
             match = re.search(r'(?:href|formaction)="(/user/company/export/\d+/)"', r.text)
             if not match:
                 page_url = f"{BASE}/company/{slug}/"
-                r = req.get(page_url, headers=HEADERS, cookies=COOKIES, timeout=REQUEST_TIMEOUT)
+                r = _HTTP.get(page_url, cookies=COOKIES, timeout=REQUEST_TIMEOUT)
                 match = re.search(r'(?:href|formaction)="(/user/company/export/\d+/)"', r.text)
             if not match:
                 log.info("No export URL for PDF slug=%s, falling back to HTML scrape", slug)
@@ -4286,22 +4887,23 @@ def generate_pdf():
                 data = analyze_full(name, slug, sheets, biz_info, yahoo_data)
             else:
                 export_url = BASE + match.group(1)
-                r2 = req.get(export_url, headers=HEADERS, cookies=COOKIES, timeout=(5, 15))
+                r2 = _HTTP.get(export_url, cookies=COOKIES, timeout=(5, 15))
                 r2.raise_for_status()
                 csrf_match = re.search(r'csrfmiddlewaretoken[^>]+value="([^"]+)"', r2.text)
                 if not csrf_match:
                     return jsonify({"error": "Screener.in session expired."}), 401
                 all_cookies = {**COOKIES, **{k: v for k, v in r2.cookies.items()}}
-                r3 = req.post(export_url, headers=HEADERS, cookies=all_cookies,
+                r3 = _HTTP.post(export_url, cookies=all_cookies,
                               data={"csrfmiddlewaretoken": csrf_match.group(1), "next": page_url},
                               timeout=(5, 15))
                 r3.raise_for_status()
                 content = r3.content
-                is_excel = (content[:2] == b'PK'
-                            or content[:4] == b'\xd0\xcf\x11\xe0'
-                            or (len(content) > 500
-                                and (b'worksheet' in content[:2000].lower()
-                                     or b'<?xml' in content[:200].lower())))
+                is_excel = (len(content) <= MAX_REMOTE_BYTES
+                            and (content[:2] == b'PK'
+                                 or content[:4] == b'\xd0\xcf\x11\xe0'
+                                 or (len(content) > 500
+                                     and (b'worksheet' in content[:2000].lower()
+                                          or b'<?xml' in content[:200].lower()))))
                 if not is_excel:
                     log.info("Excel export failed for PDF slug=%s, falling back to HTML scrape", slug)
                     sheets = scrape_html(slug)
@@ -4356,6 +4958,10 @@ def live_price():
     live = get_live_price(slug, name)
     if live:
         _LIVE_CACHE[slug] = (now, live)
+        # Evict stale entries so the cache cannot grow without bound
+        for k, (ts, _) in list(_LIVE_CACHE.items()):
+            if (now - ts) > (_LIVE_TTL * 10):
+                del _LIVE_CACHE[k]
         resp = jsonify(live)
     else:
         resp = jsonify({"error": "Live price not available", "price": None})
@@ -4395,21 +5001,33 @@ def us_analyze_route():
         return jsonify({"error": "No ticker provided"}), 400
     if not TICKER_RE.match(ticker):
         return jsonify({"error": "Invalid ticker format"}), 400
+
+    # Optional per-request provider mode override (never mutates global state)
+    mode_name = request.args.get("mode", "").strip().lower()
+    mode_enum = None
+    if mode_name:
+        if mode_name not in ("smart", "primary_only", "both"):
+            return jsonify({"error": "Invalid mode. Must be one of: smart, primary_only, both"}), 400
+        from providers import DataMode
+        mode_enum = {"smart": DataMode.SMART, "primary_only": DataMode.PRIMARY_ONLY,
+                     "both": DataMode.BOTH}[mode_name]
+
     try:
         now = datetime.now()
-        cache_entry = _US_ANALYZE_CACHE.get(ticker)
+        cache_key = f"{ticker}:{mode_name or FINANCE_DATA_MODE}"
+        cache_entry = _US_ANALYZE_CACHE.get(cache_key)
         if cache_entry and (now - cache_entry[0]) < _US_ANALYZE_TTL:
-            log.info("Cache hit for /api/us/analyze ticker=%s", ticker)
+            log.info("Cache hit for /api/us/analyze ticker=%s mode=%s", ticker, mode_name or FINANCE_DATA_MODE)
             resp = jsonify(cache_entry[1])
             resp.headers["Cache-Control"] = "public, max-age=900"
             return resp
 
-        result = analyze_us_stock(ticker)
+        result = analyze_us_stock(ticker, mode_enum)
         fw_results = result.get("investor_frameworks", {}).get("frameworks", [])
         result["sector_context"] = compute_sector_context(
             ticker, fw_results, result.get("overall")
         )
-        _US_ANALYZE_CACHE[ticker] = (now, result)
+        _US_ANALYZE_CACHE[cache_key] = (now, result)
         for k, (ts, _) in list(_US_ANALYZE_CACHE.items()):
             if (now - ts) > _US_ANALYZE_TTL:
                 del _US_ANALYZE_CACHE[k]
@@ -4430,7 +5048,7 @@ def us_sector_route():
     if not sector:
         return jsonify({"error": "No sector provided", "available": list(US_SECTORS.keys())}), 400
     try:
-        result = us_sector_analysis(sector)
+        result = get_cached_sector_analysis(sector)
         resp = jsonify(result)
         resp.headers["Cache-Control"] = "no-store"
         return resp
@@ -4442,6 +5060,66 @@ def us_sector_route():
 @app.route("/api/us/sectors")
 def us_sectors_list():
     return jsonify(list(US_SECTORS.keys()))
+
+
+@app.route("/api/provider/mode", methods=["GET", "POST"])
+def provider_mode_route():
+    """Get or set the provider mode."""
+    global FINANCE_DATA_MODE
+    pm = get_provider_manager()
+
+    if request.method == "GET":
+        return jsonify({
+            "mode": FINANCE_DATA_MODE,
+            "available_modes": ["smart", "primary_only", "both"],
+            "providers": {
+                "primary": "yahoo_finance",
+                "secondary": "alpha_vantage" if ALPHA_VANTAGE_API_KEY else None,
+                "tertiary": "financial_modeling_prep" if FMP_API_KEY else None,
+            },
+            "alpha_vantage_configured": bool(ALPHA_VANTAGE_API_KEY),
+            "fmp_configured": bool(FMP_API_KEY),
+        })
+
+    # POST - change mode
+    data = request.get_json() or {}
+    new_mode = data.get("mode", "").strip().lower()
+    if new_mode not in ("smart", "primary_only", "both"):
+        return jsonify({"error": "Invalid mode. Must be one of: smart, primary_only, both"}), 400
+
+    from providers import DataMode
+    mode_map = {"smart": DataMode.SMART, "primary_only": DataMode.PRIMARY_ONLY, "both": DataMode.BOTH}
+    pm.set_mode(mode_map[new_mode])
+    FINANCE_DATA_MODE = new_mode
+
+    log.info(f"Provider mode changed to {new_mode}")
+    return jsonify({
+        "mode": FINANCE_DATA_MODE,
+        "message": f"Provider mode changed to {new_mode}",
+    })
+
+
+@app.route("/api/us/historical-pe")
+def us_historical_pe_route():
+    """Get historical quarterly P/E ratio data for a US stock."""
+    rl = _rate_limit()
+    if rl:
+        return rl
+    ticker = request.args.get("ticker", "").strip().upper()
+    if not ticker:
+        return jsonify({"error": "No ticker provided"}), 400
+    if not TICKER_RE.match(ticker):
+        return jsonify({"error": "Invalid ticker format"}), 400
+    try:
+        data = get_cached_historical_pe(ticker)
+        if data is None:
+            return jsonify({"error": f"Historical P/E data not available for {ticker}"}), 404
+        resp = jsonify(data)
+        resp.headers["Cache-Control"] = "public, max-age=21600"  # 6 hours
+        return resp
+    except Exception as e:
+        log.exception("/api/us/historical-pe failed for ticker=%s", ticker)
+        return jsonify({"error": f"Failed to fetch historical P/E for {ticker}"}), 500
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4800,5 +5478,20 @@ def build_pdf(A):
 
 
 if __name__ == "__main__":
-    print("\n*** Stock Analyzer running at http://localhost:5000 ***\n")
-    app.run(debug=True, port=5000)
+    host = os.environ.get("HOST", "127.0.0.1")
+    port = int(os.environ.get("PORT", "5000"))
+    debug = os.environ.get("FLASK_DEBUG", "0").strip() in ("1", "true", "yes")
+    if os.environ.get("PRODUCTION", "").strip() in ("1", "true", "yes"):
+        # Production: run behind waitress (pip install waitress) instead of the
+        # Werkzeug dev server. Never run debug mode in production.
+        try:
+            from waitress import serve
+            log.info("Serving with waitress on %s:%s", host, port)
+            serve(app, host=host, port=port, threads=8)
+        except ImportError:
+            log.warning("waitress not installed; falling back to Flask server. "
+                        "Run: pip install waitress")
+            app.run(host=host, port=port, debug=False)
+    else:
+        print(f"\n*** Stock Analyzer running at http://{'localhost' if host in ('127.0.0.1', '0.0.0.0') else host}:{port} ***\n")
+        app.run(host=host, port=port, debug=debug)
